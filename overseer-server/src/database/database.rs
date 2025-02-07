@@ -3,7 +3,7 @@ use std::{borrow::Borrow, sync::{Arc, RwLock}};
 use overseer::models::{Key, Value};
 use whirlwind::ShardMap;
 
-use super::watcher::{WatchClient, WatchServer, Watcher, WatcherBehaviour};
+use super::watcher::{WatchClient, WatchServer, Watcher, WatcherActivity, WatcherBehaviour};
 
 
 
@@ -50,11 +50,12 @@ impl Database {
     
     pub async fn insert<K, V>(&self, key: K, value: V)
     where 
-        K: Borrow<Key>,
+        K: Into<Key>,
         V: Into<Value>
     {
+        let key = key.into();
         let value = Arc::new(value.into());
-        self.records.insert(key.borrow().clone(), Record {
+        self.records.insert(key.clone(), Record {
             value: Arc::clone(&value)
         }).await;
         self.notify(key.borrow(), Some(value)).await;
@@ -63,14 +64,27 @@ impl Database {
     pub async fn len(&self) -> usize {
         self.records.len().await
     }
-    pub async fn subscribe(&self, key: Key, behaviour: WatcherBehaviour) -> Watcher<WatchClient> {
+    pub async fn subscribe<K>(&self, key: K, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
+        where 
+            K: Into<Key>
+    {
+        let key= key.into();
         let (client, server) = Watcher::new(behaviour);
+        
+        if let WatcherActivity::Kickback = activity {
+            // Kick the value back immediately.
+            server.wake(self.get(&key).await);
+        }
+        
         if !self.watchers.contains_key(&key).await {
             self.watchers.insert(key.clone(), RwLock::new(vec![server])).await;
         } else {
             let obj = self.watchers.get(&key).await;
             obj.unwrap().write().unwrap().push(server);
         }
+
+        
+
         client
     }
     pub async fn notify(&self, key: &Key, value: Option<Arc<Value>>) -> bool {
@@ -109,7 +123,7 @@ mod tests {
     use overseer::models::{Key, Value};
     use tokio::sync::Notify;
 
-    use crate::database::{watcher::WatcherBehaviour, Database};
+    use crate::database::{watcher::{WatcherActivity, WatcherBehaviour}, Database};
 
 
     #[tokio::test]
@@ -158,7 +172,7 @@ mod tests {
 
                 is_up.notify_one();
 
-                let subbed = db.subscribe(Key::from_str("hello"), WatcherBehaviour::Ordered).await;
+                let subbed = db.subscribe(Key::from_str("hello"), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
                 
 
                 let mut status = true;
@@ -206,10 +220,64 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..100 {
             handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Ordered).await;
+                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
                 async move {
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
+                }
+            }));
+        }
+
+
+        // We start out with twelve brokers.
+        db.insert(Key::from_str(KEY), 12).await;
+
+        // Now let us scale down to 6.
+        db.insert(Key::from_str(KEY), 6).await;
+
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+
+
+    }
+
+    #[tokio::test]
+    pub async fn test_watcher_kickback_versus_lazy() {
+        const KEY: &str = "database.pool.size";
+
+        let db = Database::new();
+        db.insert(KEY, 0).await;
+
+        let lazy = db.subscribe(KEY, WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+        let kickback = db.subscribe(KEY, WatcherBehaviour::Eager, WatcherActivity::Kickback).await;
+
+        // The kickback should have the value.
+        assert!(lazy.force_recv().await.is_none());
+        assert_eq!(kickback.force_recv().await.unwrap().as_integer().unwrap(), 0);
+
+
+    }
+
+    #[tokio::test]
+    /// This tests a complex setup with many watchers.
+    /// This test specifically deals with eager watchers, which means that they
+    /// can see either value (depending on when they receive it.)
+    pub async fn many_eager_watchers() {
+        const KEY: &str = "config.kafka.brokers";
+
+        let db = Database::new();
+
+        let mut handles = vec![];
+        for _ in 0..100 {
+            handles.push(tokio::spawn({
+                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+                async move {
+
+                    let int = watcher.wait().await.unwrap().as_integer().unwrap();
+                    assert!(int == 12 || int == 6);
                 }
             }));
         }

@@ -7,11 +7,20 @@ use tokio::sync::Notify;
 pub struct WatchServer;
 pub struct WatchClient;
 
+// TODO: Way to notify all watchers at the same time.
+
 pub enum WatcherBehaviour {
     /// Watcher returns values in order
     Ordered,
     /// The watcher only stores the immediate result.
     Eager
+}
+
+pub enum WatcherActivity {
+    /// Kicks the initial state back to the watcher immediately.
+    Kickback,
+    /// The watcher looks for new updates only.
+    Lazy
 }
 
 type EagerInner = Arc<Mutex<Option<Arc<Value>>>>;
@@ -64,7 +73,16 @@ impl Watcher<()> {
 
 
 impl Watcher<WatchClient> {
-    
+    pub async fn force_recv(&self) -> Option<Arc<Value>> {
+        match self {
+            Self::Eager { value, .. } => {
+                value.lock().unwrap().take()
+            },
+            Self::Ordered { value, .. } => {
+                value.lock().unwrap().pop_front()?
+            }
+        } 
+    }
     pub async fn wait(&self) -> Option<Arc<Value>> {
         match self {
             Self::Eager { value, wakeup, .. } => {

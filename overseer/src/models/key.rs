@@ -7,3 +7,15 @@ impl Key {
         Self(key.as_ref().to_string())
     }
 }
+
+impl Into<Key> for &str {
+    fn into(self) -> Key {
+        Key(self.to_string())
+    }
+}
+
+impl Into<Key> for String {
+    fn into(self) -> Key {
+        Key(self)
+    }
+}
