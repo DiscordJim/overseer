@@ -1,35 +1,106 @@
-use std::{collections::VecDeque, sync::{Arc, Mutex}};
+use std::{collections::VecDeque, marker::PhantomData, sync::{Arc, Mutex}};
 
 use overseer::models::Value;
 use tokio::sync::Notify;
 
 
+pub struct WatchServer;
+pub struct WatchClient;
 
-#[derive(Clone)]
-pub struct Watcher {
-    triggered: Arc<Mutex<VecDeque<Option<Arc<Value>>>>>,
-    wakeup: Arc<Notify>
+pub enum WatcherBehaviour {
+    /// Watcher returns values in order
+    Ordered,
+    /// The watcher only stores the immediate result.
+    Eager
 }
 
-impl Watcher {
-    pub fn new() -> Self {
-        Self {
-            triggered: Arc::default(),
-            wakeup: Arc::default()
+type EagerInner = Arc<Mutex<Option<Arc<Value>>>>;
+type OrderedInner = Arc<Mutex<VecDeque<Option<Arc<Value>>>>>;
+
+pub enum Watcher<S> {
+    /// An ordered watcher returns things in the order of
+    /// which they came.
+    Ordered {
+        value: OrderedInner,
+        wakeup: Arc<Notify>,
+        side: PhantomData<S>,
+    },
+    /// An eager watcher does not care for this.
+    Eager {
+        value: EagerInner,
+        wakeup: Arc<Notify>,
+        side: PhantomData<S>
+    }
+}
+
+
+impl Watcher<()> {
+    /// Returns a split watcher. One of these is for
+    /// the client and there other is for the server.
+    pub fn new(class: WatcherBehaviour) -> (Watcher<WatchClient>, Watcher<WatchServer>) {
+
+        let wakeup = Arc::new(Notify::new());
+        match class {
+            WatcherBehaviour::Eager => {
+                let value: EagerInner = EagerInner::default();
+
+                (
+                    Watcher::Eager { value: Arc::clone(&value), wakeup: Arc::clone(&wakeup), side: PhantomData },
+                    Watcher::Eager { value, wakeup, side: PhantomData }
+                )
+
+            },
+            WatcherBehaviour::Ordered => {
+                let value: OrderedInner = OrderedInner::default();
+
+                (
+                    Watcher::Ordered { value: Arc::clone(&value), side: PhantomData, wakeup: Arc::clone(&wakeup) },
+                    Watcher::Ordered { value, side: PhantomData, wakeup }
+                )
+            }
         }
     }
+}
+
+
+impl Watcher<WatchClient> {
+    
     pub async fn wait(&self) -> Option<Arc<Value>> {
-        if !self.triggered.lock().unwrap().is_empty() {
-            self.triggered.lock().unwrap().pop_front()?
-        } else {
-            self.wakeup.notified().await;
-            let popped = self.triggered.lock().unwrap().pop_front()?;
-            popped
+        match self {
+            Self::Eager { value, wakeup, .. } => {
+                if value.lock().unwrap().is_some() {
+                    value.lock().unwrap().take()
+                } else {
+                    wakeup.notified().await;
+                    value.lock().unwrap().take()
+                }
+            },
+            Self::Ordered { value, wakeup, .. } => {
+                if !value.lock().unwrap().is_empty() {
+                    value.lock().unwrap().pop_front()?
+                } else {
+                    wakeup.notified().await;
+                    value.lock().unwrap().pop_front()?
+                }
+            }
         }
     }
-    pub fn wake(&self, value: Option<Arc<Value>>) {
-        self.triggered.lock().unwrap().push_back(value);
-        self.wakeup.notify_one();
+    
+}
+
+impl Watcher<WatchServer> {
+    pub fn wake(&self, nvalue: Option<Arc<Value>>) {
+        match self {
+            Self::Eager { value, wakeup, .. } => {
+                *value.lock().unwrap() = nvalue;
+                wakeup.notify_one();
+                
+            },
+            Self::Ordered { value, wakeup, .. } => {
+                value.lock().unwrap().push_back(nvalue);
+                wakeup.notify_one();
+            }
+        }
     }
 }
 
@@ -38,15 +109,23 @@ impl Watcher {
 mod tests {
     use overseer::models::Value;
 
-    use crate::database::watcher::Watcher;
+    use crate::database::watcher::{Watcher, WatcherBehaviour};
 
 
     #[tokio::test]
-    pub async fn check_watcher_correctness() {
-        let watcher = Watcher::new();
-        watcher.wake(None);
-        watcher.wake(Some(Value::Integer(0).into()));
-        assert!(watcher.wait().await.is_none());
-        assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 0);
+    pub async fn check_watcher_correctness_ordered() {
+        let (client, server) = Watcher::new(WatcherBehaviour::Ordered);
+        server.wake(None);
+        server.wake(Some(Value::Integer(0).into()));
+        assert!(client.wait().await.is_none());
+        assert_eq!(client.wait().await.unwrap().as_integer().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    pub async fn check_watcher_correctness_eager() {
+        let (client, server) = Watcher::new(WatcherBehaviour::Eager);
+        server.wake(None);
+        server.wake(Some(Value::Integer(0).into()));
+        assert_eq!(client.wait().await.unwrap().as_integer().unwrap(), 0);
     }
 }

@@ -3,7 +3,7 @@ use std::{borrow::Borrow, sync::{Arc, RwLock}};
 use overseer::models::{Key, Value};
 use whirlwind::ShardMap;
 
-use super::watcher::Watcher;
+use super::watcher::{WatchClient, WatchServer, Watcher, WatcherBehaviour};
 
 
 
@@ -11,7 +11,7 @@ pub struct Database {
     /// The database list of records.
     records: ShardMap<Key, Record>,
     /// The list of watchers.
-    watchers: ShardMap<Key, RwLock<Vec<Watcher>>>
+    watchers: ShardMap<Key, RwLock<Vec<Watcher<WatchServer>>>>
 }
 
 pub struct Record {
@@ -63,15 +63,15 @@ impl Database {
     pub async fn len(&self) -> usize {
         self.records.len().await
     }
-    pub async fn subscribe(&self, key: Key) -> Watcher {
-        let watcher = Watcher::new();
+    pub async fn subscribe(&self, key: Key, behaviour: WatcherBehaviour) -> Watcher<WatchClient> {
+        let (client, server) = Watcher::new(behaviour);
         if !self.watchers.contains_key(&key).await {
-            self.watchers.insert(key.clone(), RwLock::new(vec![watcher.clone()])).await;
+            self.watchers.insert(key.clone(), RwLock::new(vec![server])).await;
         } else {
             let obj = self.watchers.get(&key).await;
-            obj.unwrap().write().unwrap().push(watcher.clone());
+            obj.unwrap().write().unwrap().push(server);
         }
-        watcher
+        client
     }
     pub async fn notify(&self, key: &Key, value: Option<Arc<Value>>) -> bool {
         if !self.watchers.contains_key(&key).await {
@@ -109,7 +109,7 @@ mod tests {
     use overseer::models::{Key, Value};
     use tokio::sync::Notify;
 
-    use crate::database::Database;
+    use crate::database::{watcher::WatcherBehaviour, Database};
 
 
     #[tokio::test]
@@ -158,7 +158,7 @@ mod tests {
 
                 is_up.notify_one();
 
-                let subbed = db.subscribe(Key::from_str("hello")).await;
+                let subbed = db.subscribe(Key::from_str("hello"), WatcherBehaviour::Ordered).await;
                 
 
                 let mut status = true;
@@ -206,7 +206,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..100 {
             handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY)).await;
+                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Ordered).await;
                 async move {
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
