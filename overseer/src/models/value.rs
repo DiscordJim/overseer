@@ -30,6 +30,18 @@ impl Value {
     }
 }
 
+impl Into<Value> for i64 {
+     fn into(self) -> Value {
+         Value::Integer(self)
+     }
+}
+
+impl Into<Value> for &str {
+    fn into(self) -> Value {
+        Value::String(self.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Value;

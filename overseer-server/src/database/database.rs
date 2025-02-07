@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, sync::{atomic::{AtomicUsize, Ordering}, Arc, RwLock}};
+use std::{borrow::Borrow, sync::{Arc, RwLock}};
 
 use overseer::models::{Key, Value};
 use whirlwind::ShardMap;
@@ -8,8 +8,6 @@ use super::watcher::Watcher;
 
 
 pub struct Database {
-    /// How many entries in the database are currently tombstoned?
-    tombstoned: AtomicUsize,
     /// The database list of records.
     records: ShardMap<Key, Record>,
     /// The list of watchers.
@@ -23,7 +21,7 @@ pub struct Record {
 pub struct DbRecord//(Arc<(Key, RwLock<Option<Record>>)>); 
 {
     key: Key,
-    record: RwLock<Option<Record>>
+    record: Record
 }
 
 impl DbRecord {
@@ -31,35 +29,14 @@ impl DbRecord {
 
         Self {
             key: key.clone(),
-            record: RwLock::new(Some(Record {
-                value
-            }))
+            record: Record { value }
         }
-    }
-    pub fn is_tombstone(&self) -> bool {
-        self.record.read().unwrap().is_none()
     }
     pub fn key(&self) -> &Key {
         &self.key
     }
-    pub fn update(&self, value: Arc<Value>) {
-        let mut lock = self.record.write().unwrap();
-        match &mut *lock {
-            Some(re) => {
-                re.value = value;
-            },
-            None => {
-                *lock = Some(Record { value }.into())
-            }
-        }
-        
-    }
     pub fn value_unchecked(&self) -> Arc<Value> {
-        Arc::clone(&self.record.read().unwrap().as_ref().unwrap().value)
-        // self.record.read().unwrap().as_ref().unwrap().value.clone()
-    }
-    pub fn tombstone(&self) {
-        *self.record.write().unwrap() = None;
+        Arc::clone(&self.record.value)
     }
 }
 
@@ -68,30 +45,21 @@ impl Database {
         Self {
             records: ShardMap::new(),
             watchers: ShardMap::new(),
-            tombstoned: AtomicUsize::new(0)
         }
     }
     
-    pub async fn insert<K: Borrow<Key>>(&self, key: K, value: Value) {
-
-        // let notif = key.clone();
-        let value = Arc::new(value);
-
+    pub async fn insert<K, V>(&self, key: K, value: V)
+    where 
+        K: Borrow<Key>,
+        V: Into<Value>
+    {
+        let value = Arc::new(value.into());
         self.records.insert(key.borrow().clone(), Record {
             value: Arc::clone(&value)
         }).await;
-
-        
-        
-        // let read_lock = self.records.read().unwrap();
-        // if let Some((key, value)) = insert_tombstone_or_update(&read_lock, &self.tombstoned, key, &value) {
-        //     // This must be a new record that we had no empty slots to insert in.
-        //     drop(read_lock);
-        //     self.records.write().unwrap().push(DbRecord::new(key.clone(), Arc::clone(&value)));
-        // }
-        // println!("Notifying with {:?}", val);
         self.notify(key.borrow(), Some(value)).await;
     }
+
     pub async fn len(&self) -> usize {
         self.records.len().await
     }
@@ -114,8 +82,6 @@ impl Database {
             }
             true
         }
-        
-
     }
     pub async fn delete(&self, key: &Key) -> bool {
         if self.len().await == 0 {
@@ -135,35 +101,6 @@ impl Database {
 }
 
 
-// fn insert_tombstone_or_update<'a>(master: &[DbRecord], tbs: &AtomicUsize, key: Key, value: &'a Arc<Value>) -> Option<(Key, &'a Arc<Value>)> {
-
-//     let mut first_tombstone = None;
-
-//     for (pos, record) in master.iter().enumerate() {
-//         if record.is_tombstone() && first_tombstone.is_none() {
-//             first_tombstone = Some(pos);
-
-//         }
-//         if *record.key() == key && !record.is_tombstone() {
-//             // Update the existing record.
-//             record.update(Arc::clone(value));
-//             return None;
-//         }
-        
-//     }
-
-//     // Still have not found a record. Insert at tombstone
-//     // if possible.
-//     if let Some(pos) = first_tombstone {
-
-//         tbs.fetch_sub(1, Ordering::Release);
-//         master[pos].update(Arc::clone(value));
-//         return None;
-//     }
-
-
-//     Some((key, value))
-// }
 
 #[cfg(test)]
 mod tests {
@@ -255,6 +192,41 @@ mod tests {
 
         assert!(handle.await.unwrap());
      
+
+    }
+
+
+    #[tokio::test]
+    /// This tests a complex setup with many watchers.
+    pub async fn many_watchers() {
+        const KEY: &str = "config.kafka.brokers";
+
+        let db = Database::new();
+
+        let mut handles = vec![];
+        for _ in 0..100 {
+            handles.push(tokio::spawn({
+                let watcher = db.subscribe(Key::from_str(KEY)).await;
+                async move {
+                    assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
+                    assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
+                }
+            }));
+        }
+
+
+        // We start out with twelve brokers.
+        db.insert(Key::from_str(KEY), 12).await;
+
+        // Now let us scale down to 6.
+        db.insert(Key::from_str(KEY), 6).await;
+
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        
+
 
     }
 }
