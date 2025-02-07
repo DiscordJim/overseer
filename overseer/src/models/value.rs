@@ -8,6 +8,12 @@ pub enum Value {
 
 
 impl Value {
+    pub fn discriminator(&self) -> u8 {
+        match self {
+            Self::String(..) => 0,
+            Self::Integer(..) => 1
+        }
+    }
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::String(..) => "string",

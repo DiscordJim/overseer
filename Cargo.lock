@@ -153,6 +153,7 @@ name = "overseer"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -167,6 +168,7 @@ name = "overseer-server"
 version = "0.1.0"
 dependencies = [
  "overseer",
+ "thiserror",
  "tokio",
  "whirlwind",
 ]

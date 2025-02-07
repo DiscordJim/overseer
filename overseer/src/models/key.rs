@@ -6,6 +6,9 @@ impl Key {
     pub fn from_str<S: AsRef<str>>(key: S) -> Self {
         Self(key.as_ref().to_string())
     }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl Into<Key> for &str {

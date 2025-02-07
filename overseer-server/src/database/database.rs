@@ -1,9 +1,9 @@
 use std::{borrow::Borrow, sync::{Arc, RwLock}};
 
-use overseer::models::{Key, Value};
+use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
 use whirlwind::ShardMap;
 
-use super::watcher::{WatchClient, WatchServer, Watcher, WatcherActivity, WatcherBehaviour};
+use super::watcher::{WatchClient, WatchServer, Watcher};
 
 
 
@@ -26,7 +26,6 @@ pub struct DbRecord//(Arc<(Key, RwLock<Option<Record>>)>);
 
 impl DbRecord {
     pub fn new(key: Key, value: Arc<Value>) -> Self {
-
         Self {
             key: key.clone(),
             record: Record { value }
@@ -120,10 +119,11 @@ impl Database {
 mod tests {
     use std::sync::Arc;
 
-    use overseer::models::{Key, Value};
+    use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
     use tokio::sync::Notify;
 
-    use crate::database::{watcher::{WatcherActivity, WatcherBehaviour}, Database};
+    use crate::database::Database;
+
 
 
     #[tokio::test]

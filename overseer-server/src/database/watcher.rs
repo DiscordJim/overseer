@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, marker::PhantomData, sync::{Arc, Mutex}};
 
-use overseer::models::Value;
+use overseer::{access::WatcherBehaviour, models::Value};
 use tokio::sync::Notify;
 
 
@@ -9,19 +9,7 @@ pub struct WatchClient;
 
 // TODO: Way to notify all watchers at the same time.
 
-pub enum WatcherBehaviour {
-    /// Watcher returns values in order
-    Ordered,
-    /// The watcher only stores the immediate result.
-    Eager
-}
 
-pub enum WatcherActivity {
-    /// Kicks the initial state back to the watcher immediately.
-    Kickback,
-    /// The watcher looks for new updates only.
-    Lazy
-}
 
 type EagerInner = Arc<Mutex<Option<Arc<Value>>>>;
 type OrderedInner = Arc<Mutex<VecDeque<Option<Arc<Value>>>>>;
