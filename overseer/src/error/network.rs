@@ -18,4 +18,8 @@ pub enum NetworkError {
     WatcherActivityDecodeError,
     #[error("Invalid watcher behaviour")]
     WatcherBehaviourDecodeError,
+    #[error("Could not decode option")]
+    ErrorDecodingOption,
+    #[error("Could not decode boolean")]
+    ErrorDecodingBoolean
 }

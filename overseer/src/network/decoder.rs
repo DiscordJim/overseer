@@ -18,6 +18,14 @@ pub enum Packet {
     },
     Release {
         key: Key
+    },
+    Delete {
+        key: Key
+    },
+    Notify {
+        key: Key,
+        value: Option<Value>,
+        more: bool
     }
 }
 impl Packet {
@@ -26,8 +34,16 @@ impl Packet {
             Self::Insert { .. } => 0,
             Self::Get { .. } => 1,
             Self::Watch { .. } => 2,
-            Self::Release { .. } => 3
+            Self::Release { .. } => 3,
+            Self::Delete { .. } => 4,
+            Self::Notify { .. } => 5
         }
+    }
+    pub async fn write<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<(), NetworkError> {
+        write_packet(self, writer).await
+    }
+    pub async fn read<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Self, NetworkError> {
+        read_packet(reader).await
     }
 }
 
@@ -35,24 +51,70 @@ impl Packet {
 
 // Encoder
 
-async fn write_packet<W: AsyncWriteExt + Unpin>(packet: Packet, socket: &mut W) -> Result<(), NetworkError> {
+async fn write_packet<W: AsyncWriteExt + Unpin>(packet: &Packet, socket: &mut W) -> Result<(), NetworkError> {
     socket.write_u8(packet.discriminator()).await?;
     match packet {
         Packet::Get {key} => write_get_packet(key, socket).await,
         Packet::Insert { key, value } => write_insert_packet(key, value, socket).await,
         Packet::Release { key } => write_release_packet(key, socket).await,
         Packet::Watch { key, activity, behaviour } => write_watch_packet(key, activity, behaviour, socket).await,
-        _ => unreachable!()
+        Packet::Delete { key } => write_delete_packet(key, socket).await,
+        Packet::Notify { key, value, more } => write_notify_packet(key, value, *more, socket).await
     }
 }
 
-async fn write_watch_packet<W: AsyncWriteExt + Unpin>(key: Key, activity: WatcherActivity, behaviour: WatcherBehaviour, socket: &mut W) -> Result<(), NetworkError> {
+async fn write_notify_packet<W: AsyncWriteExt + Unpin>(key: &Key, value: &Option<Value>, more: bool, socket: &mut W) -> Result<(), NetworkError> {
+    write_key(&key, socket).await?;
+    write_optional_value(value, socket).await?;
+    write_bool(more, socket).await?;
+    Ok(())
+}
+
+async fn write_bool<W: AsyncWriteExt + Unpin>(val: bool, writer: &mut W) -> Result<(), NetworkError> {
+    if val {
+        writer.write_all(&[1]).await?;
+    } else {
+        writer.write_all(&[0]).await?;
+    }
+    Ok(())
+}
+
+async fn read_bool<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<bool, NetworkError> {
+    Ok(match reader.read_u8().await? {
+        0 => false,
+        1 => true,
+        _ => Err(NetworkError::ErrorDecodingBoolean)?
+    })
+}
+
+async fn write_optional_value<W: AsyncWriteExt + Unpin>(val: &Option<Value>, writer: &mut W) -> Result<(), NetworkError> {
+    match val {
+        Some(v) => {
+            writer.write_all(&[1]).await?;
+            write_value(v, writer).await?;
+        },
+        None => {
+            writer.write_all(&[0]).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn read_optional_value<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Option<Value>, NetworkError> {
+    Ok(match reader.read_u8().await? {
+        0 => None,
+        1 => Some(decode_value(reader).await?),
+        _ => Err(NetworkError::ErrorDecodingOption)?
+    })
+}
+
+async fn write_watch_packet<W: AsyncWriteExt + Unpin>(key: &Key, activity: &WatcherActivity, behaviour:& WatcherBehaviour, socket: &mut W) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
     socket.write_all(&[ activity.discriminator(), behaviour.discriminator() ]).await?;
     Ok(())
 }
 
-async fn write_insert_packet<W: AsyncWriteExt + Unpin>(key: Key, value: Value, socket: &mut W) -> Result<(), NetworkError> {
+async fn write_insert_packet<W: AsyncWriteExt + Unpin>(key: &Key, value: &Value, socket: &mut W) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
     write_value(&value, socket).await?;
     Ok(())
@@ -78,12 +140,17 @@ async fn write_value_integer<W: AsyncWriteExt + Unpin>(value: i64, socket: &mut 
     Ok(())
 }
 
-async fn write_get_packet<W: AsyncWriteExt + Unpin>(key: Key, socket: &mut W) -> Result<(), NetworkError> {
+async fn write_delete_packet<W: AsyncWriteExt + Unpin>(key: &Key, socket: &mut W) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
     Ok(())
 }
 
-async fn write_release_packet<W: AsyncWriteExt + Unpin>(key: Key, socket: &mut W) -> Result<(), NetworkError> {
+async fn write_get_packet<W: AsyncWriteExt + Unpin>(key: &Key, socket: &mut W) -> Result<(), NetworkError> {
+    write_key(&key, socket).await?;
+    Ok(())
+}
+
+async fn write_release_packet<W: AsyncWriteExt + Unpin>(key: &Key, socket: &mut W) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
     Ok(())
 }
@@ -104,8 +171,24 @@ async fn read_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, Net
         1 => read_get_packet(socket).await,
         2 => read_watch_packet(socket).await,
         3 => read_release_packet(socket).await,
+        4 => read_delete_packet(socket).await,
+        5 => read_notify_packet(socket).await,
         x => Err(NetworkError::UnrecognizedPacketTypeDiscriminator(x))
     }
+}
+
+/// Reads a packet of the set type.
+async fn read_notify_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
+    let key = read_key(socket).await?;
+    let value = read_optional_value(socket).await?;
+    let more = read_bool(socket).await?;
+    Ok(Packet::Notify { key, value, more })
+}
+
+/// Reads a packet of the set type.
+async fn read_delete_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
+    let key = read_key(socket).await?;
+    Ok(Packet::Delete { key })
 }
 
 /// Reads a packet of the set type.
@@ -207,11 +290,119 @@ mod tests {
 
     use tokio::io::AsyncReadExt;
 
-    use crate::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}, network::decoder::{read_packet, write_packet}};
+    use crate::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}, network::decoder::{read_bool, read_optional_value, read_packet, write_bool, write_optional_value, write_packet}};
 
     use super::Packet;
 
     // use crate::net::{driver::read_packet, Driver};
+
+    #[tokio::test]
+    pub async fn read_bool_test() {
+        let mut cursor = Cursor::new(vec![0, 1]);
+        assert_eq!(read_bool(&mut cursor).await.unwrap(), false);
+        assert_eq!(read_bool(&mut cursor).await.unwrap(), true);
+    }
+
+    #[tokio::test]
+    pub async fn read_optional_value_test() {
+        // Write a null.
+        let mut cursor = Cursor::new([0, 1, 1, 64, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(read_optional_value(&mut cursor).await.unwrap(), None);
+        assert_eq!(read_optional_value(&mut cursor).await.unwrap(), Some(Value::Integer(64)));
+
+
+    }
+
+    #[tokio::test]
+    pub async fn write_optional_value_test() {
+        // Write a null.
+        let mut cursor = vec![];
+        write_optional_value(&None, &mut cursor).await.unwrap();
+        assert_eq!(cursor.len(), 1);
+        assert_eq!(cursor[0], 0);
+
+        // Write some value
+        let mut cursor = vec![];
+        write_optional_value(&Some(Value::Integer(22)), &mut cursor).await.unwrap();
+        assert_eq!(cursor.len(), 10);
+        assert_eq!(i64::from_le_bytes(cursor[2..10].try_into().unwrap()), 22);
+    }
+
+    #[tokio::test]
+    pub async fn write_bool_test() {
+        let mut cursor = vec![];
+        write_bool(true, &mut cursor).await.unwrap();
+        assert_eq!(cursor[0], 1);
+        write_bool(false, &mut cursor).await.unwrap();
+        assert_eq!(cursor[1], 0);
+    }
+
+    #[tokio::test]
+    pub async fn write_notify_packet() {
+
+        let packet = Packet::Notify {
+            key: Key::from_str("hello"),
+            value: None,
+            more: false
+        };
+
+        // Write the packet.
+        let mut cursor = Cursor::new(vec![]);
+        packet.write(&mut cursor).await.unwrap();
+        cursor.set_position(0);
+
+        
+
+        if let Packet::Notify { key, value, more } = read_packet(&mut cursor).await.unwrap() {
+            assert_eq!(key.as_str(), "hello");
+            assert!(value.is_none());
+            assert!(!more);
+        } else {
+            panic!("Wrong packet type.");
+        }
+    }
+
+    #[tokio::test]
+    pub async fn write_delete_packet() {
+
+        let packet = Packet::Delete {
+            key: Key::from_str("hello"),
+        };
+
+        // Write the packet.
+        let mut cursor = Cursor::new(vec![]);
+        packet.write(&mut cursor).await.unwrap();
+        cursor.set_position(0);
+
+        
+
+        if let Packet::Delete { key } = read_packet(&mut cursor).await.unwrap() {
+            assert_eq!(key.as_str(), "hello");
+        } else {
+            panic!("Wrong packet type.");
+        }
+    }
+
+    #[tokio::test]
+    pub async fn write_release_packet() {
+
+        let packet = Packet::Release {
+            key: Key::from_str("hello"),
+        };
+
+        // Write the packet.
+        let mut cursor = Cursor::new(vec![]);
+        packet.write(&mut cursor).await.unwrap();
+        cursor.set_position(0);
+
+        
+
+        if let Packet::Release { key } = read_packet(&mut cursor).await.unwrap() {
+            assert_eq!(key.as_str(), "hello");
+        } else {
+            panic!("Wrong packet type.");
+        }
+    }
 
     #[tokio::test]
     pub async fn write_watch_packet() {
@@ -224,7 +415,7 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(packet, &mut cursor).await.unwrap();
+        write_packet(&packet, &mut cursor).await.unwrap();
         cursor.set_position(0);
 
         
@@ -245,7 +436,7 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(packet, &mut cursor).await.unwrap();
+        write_packet(&packet, &mut cursor).await.unwrap();
         cursor.set_position(0);
 
         
@@ -265,7 +456,7 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(packet, &mut cursor).await.unwrap();
+        write_packet(&packet, &mut cursor).await.unwrap();
         cursor.set_position(0);
 
         if let Packet::Insert { key, value } = read_packet(&mut cursor).await.unwrap() {
@@ -283,7 +474,7 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(packet, &mut cursor).await.unwrap();
+        write_packet(&packet, &mut cursor).await.unwrap();
         cursor.set_position(0);
 
         if let Packet::Get { key } = read_packet(&mut cursor).await.unwrap() {
@@ -311,6 +502,30 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn read_notify_packet() {
+
+        let skey = "hello";
+        let mut buffer = vec![5u8];
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(skey.as_bytes());
+
+        // 1 = Some
+        // 1 = Integer
+        // 64 0 0 0 0 0 0 0 = A i64 of 64
+        // 1 = True
+        buffer.extend_from_slice(&[ 1, 1, 64, 0, 0, 0, 0, 0, 0, 0, 1 ]);
+
+
+        if let Packet::Notify { key, value, more } = Packet::read(&mut Cursor::new(buffer)).await.unwrap() {
+            assert_eq!(key, Key::from_str(skey));
+            assert_eq!(value.unwrap(), Value::Integer(64));
+            assert!(more);
+        } else {
+            panic!("Packet did not decode as the proper type.");
+        }
+    }
+
+    #[tokio::test]
     pub async fn read_watch_packet() {
 
         let skey = "hello";
@@ -325,6 +540,21 @@ mod tests {
             assert_eq!(key, Key::from_str(skey));
             assert_eq!(activity, WatcherActivity::Lazy);
             assert_eq!(behaviour, WatcherBehaviour::Ordered);
+        } else {
+            panic!("Packet did not decode as the proper type.");
+        }
+    }
+
+    #[tokio::test]
+    pub async fn read_delete_packet() {
+
+        let skey = "hello";
+        let mut buffer = vec![4u8];
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(skey.as_bytes());
+
+        if let Packet::Delete { key } = Packet::read(&mut Cursor::new(buffer)).await.unwrap() {
+            assert_eq!(key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
         }
