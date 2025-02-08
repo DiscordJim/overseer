@@ -2,11 +2,11 @@ use std::{net::SocketAddr, sync::Arc};
 
 use overseer::{error::NetworkError, models::Key, network::decoder::Packet};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
         TcpListener, TcpStream, ToSocketAddrs,
-    }, sync::mpsc::{Receiver, Sender},
+    },
+    sync::mpsc::{Receiver, Sender},
 };
 use whirlwind::ShardMap;
 
@@ -28,7 +28,7 @@ impl ClientId {
 struct DriverInternal {
     database: Database,
     stream: TcpListener,
-    write_queue: Arc<ShardMap<ClientId, Sender<Packet>>>
+    write_queue: Arc<ShardMap<ClientId, Sender<Packet>>>,
 }
 
 impl DriverInternal {
@@ -43,21 +43,10 @@ impl Driver {
         let internal = Arc::new(DriverInternal {
             database: Database::new(),
             stream: TcpListener::bind(addr).await?,
-            write_queue: ShardMap::new().into()
+            write_queue: ShardMap::new().into(),
         });
 
-        tokio::spawn({
-            let internal = Arc::clone(&internal);
-            async move {
-                let mut counter = 0;
-                loop {
-                    let (sock, addr) = internal.stream.accept().await?;
-                    handle_client(sock, addr, ClientId(counter), Arc::clone(&internal)).await;
-                    counter += 1;
-                }
-                Ok::<(), NetworkError>(())
-            }
-        });
+        tokio::spawn(accept_connection_loop(Arc::clone(&internal)));
 
         Ok(Self {
             internal: Arc::clone(&internal),
@@ -68,23 +57,35 @@ impl Driver {
     }
 }
 
-async fn handle_client(socket: TcpStream, _address: SocketAddr, id: ClientId, internal: Arc<DriverInternal>) {
+async fn accept_connection_loop(internal: Arc<DriverInternal>) -> Result<(), NetworkError> {
+    let mut counter = 0;
+    loop {
+        let (sock, _) = internal.stream.accept().await?;
+        handle_client(sock, ClientId(counter), Arc::clone(&internal)).await;
+        counter += 1;
+    }
+}
+
+async fn handle_client(
+    socket: TcpStream,
+    id: ClientId,
+    internal: Arc<DriverInternal>,
+) {
     println!("Spawning new client...");
     let (read, write) = socket.into_split();
     let (sender, receiver) = tokio::sync::mpsc::channel(250);
     internal.write_queue.insert(id, sender).await;
     let ctx = Arc::new(ClientContext {
         id,
-        watches: ShardMap::new()
+        watches: ShardMap::new(),
     });
     tokio::spawn(handle_client_write(write, receiver));
     tokio::spawn(handle_client_read(read, internal, ctx));
-    
 }
 
 struct ClientContext {
     id: ClientId,
-    watches: ShardMap<Key, Arc<Watcher<WatchClient>>>
+    watches: ShardMap<Key, Arc<Watcher<WatchClient>>>,
 }
 
 async fn handle_client_write(
@@ -108,17 +109,28 @@ async fn handle_client_read(
             Packet::Insert { key, value } => {
                 internal.database.insert(key.clone(), value).await;
                 internal.send(ctx.id, Packet::Get { key }).await;
-            },
+            }
             Packet::Get { key } => {
                 let value = { internal.database.get(&key).await }.map(|f| (*f).to_owned());
-                internal.send(ctx.id, Packet::GetReturn { key, value }).await;
-            },
+                internal
+                    .send(ctx.id, Packet::GetReturn { key, value })
+                    .await;
+            }
             Packet::Delete { key } => {
                 internal.database.delete(&key).await;
                 internal.send(ctx.id, Packet::get(key)).await;
-            },
-            Packet::Watch { key, activity, behaviour } => {
-                let wow = Arc::new(internal.database.subscribe(key.clone(), ctx.id, behaviour, activity).await);
+            }
+            Packet::Watch {
+                key,
+                activity,
+                behaviour,
+            } => {
+                let wow = Arc::new(
+                    internal
+                        .database
+                        .subscribe(key.clone(), ctx.id, behaviour, activity)
+                        .await,
+                );
                 ctx.watches.insert(key.clone(), Arc::clone(&wow)).await;
                 tokio::spawn({
                     let internal = Arc::clone(&internal);
@@ -127,7 +139,7 @@ async fn handle_client_read(
                         spawn_subscriber(key, wow, internal, ctx).await;
                     }
                 });
-            },
+            }
             Packet::Release { key } => {
                 if let Some(..) = ctx.watches.remove(&key).await {
                     internal.database.release(key.clone(), ctx.id).await;
@@ -135,13 +147,10 @@ async fn handle_client_read(
                     // Key not present.
                 }
                 internal.send(ctx.id, Packet::get(key)).await;
-          
-            },
-            _ => unimplemented!()
+            }
+            _ => unimplemented!(),
         }
-      
     }
-    Ok(())
 }
 
 /// Handles watchng for a certain key.
@@ -149,7 +158,7 @@ async fn spawn_subscriber(
     key: Key,
     watcher: Arc<Watcher<WatchClient>>,
     internal: Arc<DriverInternal>,
-    ctx: Arc<ClientContext>
+    ctx: Arc<ClientContext>,
 ) {
     loop {
         let val = watcher.wait().await.map(|f| (*f).to_owned());
@@ -157,7 +166,9 @@ async fn spawn_subscriber(
             // Break this and die.
             break;
         }
-        internal.send(ctx.id, Packet::notify(key.clone(), val, false)).await;   
+        internal
+            .send(ctx.id, Packet::notify(key.clone(), val, false))
+            .await;
     }
 }
 
@@ -166,18 +177,22 @@ mod tests {
     use std::{net::Ipv4Addr, sync::Arc};
 
     use overseer::{
-        access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}, network::decoder::Packet
+        access::{WatcherActivity, WatcherBehaviour},
+        error::NetworkError,
+        models::{Key, Value},
+        network::decoder::Packet,
     };
-    use tokio::{net::{TcpSocket, TcpStream}, sync::{Barrier, Notify}};
+    use tokio::{
+        net::TcpStream,
+        sync::Barrier,
+    };
 
     use crate::net::Driver;
-
-
 
     #[tokio::test]
     pub async fn test_client_subscription() {
         let mut server = Driver::start("127.0.0.1:0").await.unwrap();
-        
+
         let mut staging = Arc::new(Barrier::new(2));
         let mut staging2 = Arc::new(Barrier::new(2));
 
@@ -187,13 +202,15 @@ mod tests {
             let staging2 = Arc::clone(&staging2);
             async move {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
-                
-                // Configure a lazy watch on the brokers key.
-                Packet::watch("brokers", WatcherActivity::Lazy, WatcherBehaviour::Ordered).write(&mut connect).await?;
-                
-                tokio::spawn(async move { staging.wait().await; });
 
-              
+                // Configure a lazy watch on the brokers key.
+                Packet::watch("brokers", WatcherActivity::Lazy, WatcherBehaviour::Ordered)
+                    .write(&mut connect)
+                    .await?;
+
+                tokio::spawn(async move {
+                    staging.wait().await;
+                });
 
                 // Let us wait until this gets inserted.
                 if let Packet::Notify { key, value, .. } = Packet::read(&mut connect).await? {
@@ -211,7 +228,6 @@ mod tests {
                     panic!("Expected notify, received other type.");
                 }
 
-
                 // Let us wait until this gets inserted.
                 if let Packet::Notify { key, value, .. } = Packet::read(&mut connect).await? {
                     assert_eq!(key.as_str(), "brokers");
@@ -220,16 +236,12 @@ mod tests {
                     panic!("Expected notify, received other type.");
                 }
 
-
-                // 
+                //
 
                 Packet::release("brokers").write(&mut connect).await?;
                 matches!(Packet::read(&mut connect).await?, Packet::Get { .. });
 
-
                 staging2.wait().await;
-
-
 
                 Ok::<(), NetworkError>(())
             }
@@ -240,10 +252,8 @@ mod tests {
             let staging = Arc::clone(&staging);
             async move {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
-                
 
                 staging.wait().await;
-
 
                 // Configure a lazy watch on the brokers key.
                 Packet::insert("brokers", 145).write(&mut connect).await?;
@@ -254,17 +264,12 @@ mod tests {
 
                 Packet::insert("brokers", 13).write(&mut connect).await?;
 
-
-
-
                 Ok::<(), NetworkError>(())
             }
         });
 
         let _ = handle.await.unwrap();
         let _ = handle2.await.unwrap();
-
-
     }
 
     #[tokio::test]
@@ -276,7 +281,6 @@ mod tests {
             async move {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
 
-
                 Packet::Insert {
                     key: Key::from_str("hello"),
                     value: Value::Integer(62),
@@ -287,7 +291,11 @@ mod tests {
                 let packet = Packet::read(&mut connect).await?;
                 matches!(packet, Packet::Get { .. });
 
-                Packet::Get { key: Key::from_str("hello") }.write(&mut connect).await?;
+                Packet::Get {
+                    key: Key::from_str("hello"),
+                }
+                .write(&mut connect)
+                .await?;
 
                 if let Packet::GetReturn { key, value } = Packet::read(&mut connect).await? {
                     assert_eq!(key.as_str(), "hello");
@@ -297,11 +305,15 @@ mod tests {
                 }
 
                 // Try deleting a key.
-                Packet::delete(Key::from_str("hello")).write(&mut connect).await?;
-                matches!(Packet::read(&mut connect).await?, Packet::Delete {..});
+                Packet::delete(Key::from_str("hello"))
+                    .write(&mut connect)
+                    .await?;
+                matches!(Packet::read(&mut connect).await?, Packet::Delete { .. });
 
                 // Get the key back, should be deleted.
-                Packet::get(Key::from_str("hello")).write(&mut connect).await?;
+                Packet::get(Key::from_str("hello"))
+                    .write(&mut connect)
+                    .await?;
                 if let Packet::GetReturn { key, value } = Packet::read(&mut connect).await? {
                     assert_eq!(key.as_str(), "hello");
                     assert_eq!(value, None);
@@ -309,13 +321,10 @@ mod tests {
                     panic!("Incorrect packet type.");
                 }
 
-
                 Ok::<(), NetworkError>(())
             }
         });
 
         let _ = handle.await.unwrap();
-
-
     }
 }
