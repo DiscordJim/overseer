@@ -1,7 +1,10 @@
-use std::{borrow::Borrow, sync::{Arc, RwLock}};
+use std::{collections::HashMap, sync::Arc};
 
 use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
+use tokio::sync::RwLock;
 use whirlwind::ShardMap;
+
+use crate::net::ClientId;
 
 use super::watcher::{WatchClient, WatchServer, Watcher};
 
@@ -11,12 +14,13 @@ pub struct Database {
     /// The database list of records.
     records: ShardMap<Key, Record>,
     /// The list of watchers.
-    watchers: ShardMap<Key, RwLock<Vec<Watcher<WatchServer>>>>
+    watchers: ShardMap<Key, Arc<RwLock<HashMap<ClientId, Watcher<WatchServer>>>>>
 }
 
 pub struct Record {
     value: Arc<Value>
 }
+
 
 pub struct DbRecord//(Arc<(Key, RwLock<Option<Record>>)>); 
 {
@@ -57,13 +61,13 @@ impl Database {
         self.records.insert(key.clone(), Record {
             value: Arc::clone(&value)
         }).await;
-        self.notify(key.borrow(), Some(value)).await;
+        self.notify(&key, Some(value)).await;
     }
 
     pub async fn len(&self) -> usize {
         self.records.len().await
     }
-    pub async fn subscribe<K>(&self, key: K, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
+    pub async fn subscribe<K>(&self, key: K, client_id: ClientId, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
         where 
             K: Into<Key>
     {
@@ -76,21 +80,65 @@ impl Database {
         }
         
         if !self.watchers.contains_key(&key).await {
-            self.watchers.insert(key.clone(), RwLock::new(vec![server])).await;
+            let mut map = HashMap::<ClientId, Watcher<WatchServer>>::new();
+            map.insert(client_id, server);
+            self.watchers.insert(key.clone(), Arc::new(RwLock::new(map))).await;
         } else {
-            let obj = self.watchers.get(&key).await;
-            obj.unwrap().write().unwrap().push(server);
+            let shard_map = self.watchers.get(&key).await.unwrap().value().clone();
+            let mut obj = shard_map.write().await;
+            obj.insert(client_id, server);
         }
 
         
 
         client
     }
+    pub async fn release<K: Into<Key>>(&self, key: K, id: ClientId) -> bool {
+        let key = key.into();
+
+        // let value = self.watchers.get(&key.into()).await;
+
+        if self.watchers.contains_key(&key).await {
+            let value = self.watchers.get(&key).await.unwrap().value().clone();
+            if let Some(kille) = value.clone().write().await.remove(&id) {
+                kille.kill();
+                true
+            } else {
+                false
+            }
+
+        } else {
+            false
+        }
+
+        // if let Some(v) = self.watchers.get(&key.into()).await {
+        //     let v2 = v.value().clone();
+        //     if let Some(killed) = v2.write().await.remove(&id) {
+        //         killed.kill();
+        //         true
+        //     } else {
+        //         // Not attached to that key.
+        //         false
+        //     }
+        // } else {
+        //     // Nothing to release.
+        //     false
+        // }
+    }
     pub async fn notify(&self, key: &Key, value: Option<Arc<Value>>) -> bool {
         if !self.watchers.contains_key(&key).await {
             false
         } else {
-            for watcher in &*self.watchers.get(&key).await.unwrap().read().unwrap() {
+
+            let hold = self.watchers.get(&key).await.unwrap().value().clone();
+            // let w = self.watchers.get(key).await.unwrap().value();
+
+            // for watcher in self.watchers.get(key).await.unwrap() {
+
+            // }
+
+            for (_, watcher) in &*hold.read().await {
+                // println!("Notifying watcher: {:?}", value);
                 watcher.wake(value.clone());
             }
             true
@@ -122,7 +170,7 @@ mod tests {
     use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
     use tokio::sync::Notify;
 
-    use crate::database::Database;
+    use crate::{database::Database, net::ClientId};
 
 
 
@@ -172,7 +220,7 @@ mod tests {
 
                 is_up.notify_one();
 
-                let subbed = db.subscribe(Key::from_str("hello"), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
+                let subbed = db.subscribe("hello", ClientId::from_id(0), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
                 
 
                 let mut status = true;
@@ -217,13 +265,17 @@ mod tests {
 
         let db = Database::new();
 
+        // println!("Make DB");
+
         let mut handles = vec![];
-        for _ in 0..100 {
+        for i in 0..100 {
             handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
+                let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
                 async move {
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
+                    // println!("Seen the first");
                     assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
+                    // println!("Seen the secon.");
                 }
             }));
         }
@@ -231,6 +283,8 @@ mod tests {
 
         // We start out with twelve brokers.
         db.insert(Key::from_str(KEY), 12).await;
+
+        // println!("Inserted");
 
         // Now let us scale down to 6.
         db.insert(Key::from_str(KEY), 6).await;
@@ -251,8 +305,8 @@ mod tests {
         let db = Database::new();
         db.insert(KEY, 0).await;
 
-        let lazy = db.subscribe(KEY, WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
-        let kickback = db.subscribe(KEY, WatcherBehaviour::Eager, WatcherActivity::Kickback).await;
+        let lazy = db.subscribe(KEY, ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+        let kickback = db.subscribe(KEY, ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Kickback).await;
 
         // The kickback should have the value.
         assert!(lazy.force_recv().await.is_none());
@@ -271,9 +325,9 @@ mod tests {
         let db = Database::new();
 
         let mut handles = vec![];
-        for _ in 0..100 {
+        for i in 0..100 {
             handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+                let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
                 async move {
 
                     let int = watcher.wait().await.unwrap().as_integer().unwrap();

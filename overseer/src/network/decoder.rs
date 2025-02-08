@@ -26,9 +26,34 @@ pub enum Packet {
         key: Key,
         value: Option<Value>,
         more: bool
+    },
+    GetReturn {
+        key: Key,
+        value: Option<Value>
     }
 }
+
+
 impl Packet {
+    pub fn notify<K: Into<Key>, V: Into<Value>>(key: K, value: Option<V>, more: bool) -> Self {
+        Self::Notify { key: key.into(), value: value.map(Into::into), more }
+
+    }
+    pub fn release<K: Into<Key>>(key: K) -> Self {
+        Self::Release { key: key.into() }
+    }
+    pub fn watch<K: Into<Key>>(key: K, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Self {
+        Self::Watch { key: key.into(), activity, behaviour }
+    }
+    pub fn insert<K: Into<Key>, V: Into<Value>>(key: K, value: V) -> Self {
+        Self::Insert { key: key.into(), value: value.into() }
+    }
+    pub fn delete<K: Into<Key>>(key: K) -> Self {
+        Self::Delete { key: key.into() }
+    }
+    pub fn get<K: Into<Key>>(key: K) -> Self {
+        Self::Get { key: key.into() }
+    }
     pub fn discriminator(&self) -> u8 {
         match self {
             Self::Insert { .. } => 0,
@@ -36,7 +61,8 @@ impl Packet {
             Self::Watch { .. } => 2,
             Self::Release { .. } => 3,
             Self::Delete { .. } => 4,
-            Self::Notify { .. } => 5
+            Self::Notify { .. } => 5,
+            Self::GetReturn { .. } => 6
         }
     }
     pub async fn write<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<(), NetworkError> {
@@ -59,8 +85,15 @@ async fn write_packet<W: AsyncWriteExt + Unpin>(packet: &Packet, socket: &mut W)
         Packet::Release { key } => write_release_packet(key, socket).await,
         Packet::Watch { key, activity, behaviour } => write_watch_packet(key, activity, behaviour, socket).await,
         Packet::Delete { key } => write_delete_packet(key, socket).await,
-        Packet::Notify { key, value, more } => write_notify_packet(key, value, *more, socket).await
+        Packet::Notify { key, value, more } => write_notify_packet(key, value, *more, socket).await,
+        Packet::GetReturn { key, value } => write_getreturn_packet(key, value, socket).await
     }
+}
+
+async fn write_getreturn_packet<W: AsyncWriteExt + Unpin>(key: &Key, val: &Option<Value>, socket: &mut W) -> Result<(), NetworkError> {
+    write_key(key, socket).await?;
+    write_optional_value(val, socket).await?;
+    Ok(())
 }
 
 async fn write_notify_packet<W: AsyncWriteExt + Unpin>(key: &Key, value: &Option<Value>, more: bool, socket: &mut W) -> Result<(), NetworkError> {
@@ -173,10 +206,18 @@ async fn read_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, Net
         3 => read_release_packet(socket).await,
         4 => read_delete_packet(socket).await,
         5 => read_notify_packet(socket).await,
+        6 => read_getreturn_packet(socket).await,
         x => Err(NetworkError::UnrecognizedPacketTypeDiscriminator(x))
     }
 }
 
+
+/// Reads a packet of the set type.
+async fn read_getreturn_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
+    let key = read_key(socket).await?;
+    let value = read_optional_value(socket).await?;
+    Ok(Packet::GetReturn { key, value })
+}
 /// Reads a packet of the set type.
 async fn read_notify_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
     let key = read_key(socket).await?;
@@ -286,9 +327,8 @@ async fn read_key<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Key, NetworkEr
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read};
+    use std::io::Cursor;
 
-    use tokio::io::AsyncReadExt;
 
     use crate::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}, network::decoder::{read_bool, read_optional_value, read_packet, write_bool, write_optional_value, write_packet}};
 

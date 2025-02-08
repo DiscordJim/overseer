@@ -4,3 +4,4 @@ mod watcher;
 
 pub use crate::database::database::*;
 pub use crate::database::storage::*;
+pub use crate::database::watcher::*;

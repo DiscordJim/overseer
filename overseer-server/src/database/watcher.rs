@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, marker::PhantomData, sync::{Arc, Mutex}};
+use std::{collections::VecDeque, marker::PhantomData, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
 use overseer::{access::WatcherBehaviour, models::Value};
 use tokio::sync::Notify;
@@ -20,12 +20,14 @@ pub enum Watcher<S> {
     Ordered {
         value: OrderedInner,
         wakeup: Arc<Notify>,
-        side: PhantomData<S>,
+        killed: Arc<AtomicBool>,
+        side: PhantomData<S>
     },
     /// An eager watcher does not care for this.
     Eager {
         value: EagerInner,
         wakeup: Arc<Notify>,
+        killed: Arc<AtomicBool>,
         side: PhantomData<S>
     }
 }
@@ -37,13 +39,14 @@ impl Watcher<()> {
     pub fn new(class: WatcherBehaviour) -> (Watcher<WatchClient>, Watcher<WatchServer>) {
 
         let wakeup = Arc::new(Notify::new());
+        let killed = Arc::new(AtomicBool::new(false));
         match class {
             WatcherBehaviour::Eager => {
                 let value: EagerInner = EagerInner::default();
 
                 (
-                    Watcher::Eager { value: Arc::clone(&value), wakeup: Arc::clone(&wakeup), side: PhantomData },
-                    Watcher::Eager { value, wakeup, side: PhantomData }
+                    Watcher::Eager { value: Arc::clone(&value), wakeup: Arc::clone(&wakeup), killed: Arc::clone(&killed), side: PhantomData },
+                    Watcher::Eager { value, wakeup, killed, side: PhantomData }
                 )
 
             },
@@ -51,13 +54,14 @@ impl Watcher<()> {
                 let value: OrderedInner = OrderedInner::default();
 
                 (
-                    Watcher::Ordered { value: Arc::clone(&value), side: PhantomData, wakeup: Arc::clone(&wakeup) },
-                    Watcher::Ordered { value, side: PhantomData, wakeup }
+                    Watcher::Ordered { value: Arc::clone(&value), side: PhantomData, wakeup: Arc::clone(&wakeup), killed: Arc::clone(&killed) },
+                    Watcher::Ordered { value, side: PhantomData, wakeup, killed }
                 )
             }
         }
     }
 }
+
 
 
 impl Watcher<WatchClient> {
@@ -91,6 +95,13 @@ impl Watcher<WatchClient> {
             }
         }
     }
+    pub fn is_killed(&self) -> bool {
+        match self {
+            Self::Eager { killed, .. } | Self::Ordered { killed, .. } => {
+                killed.load(Ordering::Acquire)
+            }
+        }
+    }
     
 }
 
@@ -99,12 +110,22 @@ impl Watcher<WatchServer> {
         match self {
             Self::Eager { value, wakeup, .. } => {
                 *value.lock().unwrap() = nvalue;
-                wakeup.notify_one();
+                wakeup.notify_waiters();
                 
             },
             Self::Ordered { value, wakeup, .. } => {
                 value.lock().unwrap().push_back(nvalue);
-                wakeup.notify_one();
+                wakeup.notify_waiters();
+            }
+        }
+    }
+    pub fn kill(&self) {
+        
+        match self {
+            Self::Eager { killed, .. } | Self::Ordered { killed, .. } => {
+                killed.store(true, Ordering::SeqCst);
+                println!("Killed: {:?}", killed.load(Ordering::SeqCst));
+                self.wake(None);
             }
         }
     }
