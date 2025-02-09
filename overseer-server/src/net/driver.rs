@@ -1,6 +1,6 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 
-use overseer::{error::NetworkError, models::Key, network::decoder::Packet};
+use overseer::{error::NetworkError, models::Key, network::Packet};
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -179,8 +179,7 @@ mod tests {
     use overseer::{
         access::{WatcherActivity, WatcherBehaviour},
         error::NetworkError,
-        models::{Key, Value},
-        network::decoder::Packet,
+        models::{Key, Value}, network::Packet
     };
     use tokio::{
         net::TcpStream,
@@ -191,10 +190,10 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_client_subscription() {
-        let mut server = Driver::start("127.0.0.1:0").await.unwrap();
+        let server = Driver::start("127.0.0.1:0").await.unwrap();
 
-        let mut staging = Arc::new(Barrier::new(2));
-        let mut staging2 = Arc::new(Barrier::new(2));
+        let staging = Arc::new(Barrier::new(2));
+        let staging2 = Arc::new(Barrier::new(2));
 
         let handle = tokio::spawn({
             let port = server.port();
@@ -274,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_client_basic() {
-        let mut server = Driver::start("127.0.0.1:0").await.unwrap();
+        let server = Driver::start("127.0.0.1:0").await.unwrap();
 
         let handle = tokio::spawn({
             let port = server.port();

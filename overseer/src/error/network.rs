@@ -21,5 +21,7 @@ pub enum NetworkError {
     #[error("Could not decode option")]
     ErrorDecodingOption,
     #[error("Could not decode boolean")]
-    ErrorDecodingBoolean
+    ErrorDecodingBoolean,
+    #[error("Unknown packet schema")]
+    UnknownPacketSchema(u8)
 }

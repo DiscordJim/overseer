@@ -1,8 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
-use tokio::sync::RwLock;
-use whirlwind::ShardMap;
 
 use crate::net::ClientId;
 
@@ -12,42 +11,20 @@ use super::watcher::{WatchClient, WatchServer, Watcher};
 
 pub struct Database {
     /// The database list of records.
-    records: ShardMap<Key, Record>,
+    records: DashMap<Key, Record>,
     /// The list of watchers.
-    watchers: ShardMap<Key, Arc<RwLock<HashMap<ClientId, Watcher<WatchServer>>>>>
+    watchers: DashMap<Key, DashMap<ClientId, Watcher<WatchServer>>>
 }
 
 pub struct Record {
     value: Arc<Value>
 }
 
-
-pub struct DbRecord//(Arc<(Key, RwLock<Option<Record>>)>); 
-{
-    key: Key,
-    record: Record
-}
-
-impl DbRecord {
-    pub fn new(key: Key, value: Arc<Value>) -> Self {
-        Self {
-            key: key.clone(),
-            record: Record { value }
-        }
-    }
-    pub fn key(&self) -> &Key {
-        &self.key
-    }
-    pub fn value_unchecked(&self) -> Arc<Value> {
-        Arc::clone(&self.record.value)
-    }
-}
-
 impl Database {
     pub fn new() -> Self {
         Self {
-            records: ShardMap::new(),
-            watchers: ShardMap::new(),
+            records: DashMap::new(),
+            watchers: DashMap::new(),
         }
     }
     
@@ -60,12 +37,12 @@ impl Database {
         let value = Arc::new(value.into());
         self.records.insert(key.clone(), Record {
             value: Arc::clone(&value)
-        }).await;
+        });
         self.notify(&key, Some(value)).await;
     }
 
     pub async fn len(&self) -> usize {
-        self.records.len().await
+        self.records.len()
     }
     pub async fn subscribe<K>(&self, key: K, client_id: ClientId, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
         where 
@@ -79,14 +56,16 @@ impl Database {
             server.wake(self.get(&key).await);
         }
         
-        if !self.watchers.contains_key(&key).await {
-            let mut map = HashMap::<ClientId, Watcher<WatchServer>>::new();
-            map.insert(client_id, server);
-            self.watchers.insert(key.clone(), Arc::new(RwLock::new(map))).await;
-        } else {
-            let shard_map = self.watchers.get(&key).await.unwrap().value().clone();
-            let mut obj = shard_map.write().await;
-            obj.insert(client_id, server);
+        match self.watchers.get(&key) {
+            Some(map) => {
+                map.insert(client_id, server);
+            },
+            None => {
+                // Not in the map.
+                let map = DashMap::new();
+                map.insert(client_id, server);
+                self.watchers.insert(key.clone(), map.into());
+            }
         }
 
         
@@ -98,9 +77,9 @@ impl Database {
 
         // let value = self.watchers.get(&key.into()).await;
 
-        if self.watchers.contains_key(&key).await {
-            let value = self.watchers.get(&key).await.unwrap().value().clone();
-            if let Some(kille) = value.clone().write().await.remove(&id) {
+        if self.watchers.contains_key(&key) {
+            let value = self.watchers.get(&key).unwrap();
+            if let Some((_, kille)) = value.remove(&id) {
                 kille.kill();
                 true
             } else {
@@ -110,36 +89,13 @@ impl Database {
         } else {
             false
         }
-
-        // if let Some(v) = self.watchers.get(&key.into()).await {
-        //     let v2 = v.value().clone();
-        //     if let Some(killed) = v2.write().await.remove(&id) {
-        //         killed.kill();
-        //         true
-        //     } else {
-        //         // Not attached to that key.
-        //         false
-        //     }
-        // } else {
-        //     // Nothing to release.
-        //     false
-        // }
     }
     pub async fn notify(&self, key: &Key, value: Option<Arc<Value>>) -> bool {
-        if !self.watchers.contains_key(&key).await {
+        if !self.watchers.contains_key(&key) {
             false
         } else {
-
-            let hold = self.watchers.get(&key).await.unwrap().value().clone();
-            // let w = self.watchers.get(key).await.unwrap().value();
-
-            // for watcher in self.watchers.get(key).await.unwrap() {
-
-            // }
-
-            for (_, watcher) in &*hold.read().await {
-                // println!("Notifying watcher: {:?}", value);
-                watcher.wake(value.clone());
+            for wa in self.watchers.get(&key).unwrap().iter() {
+                wa.value().wake(value.clone());
             }
             true
         }
@@ -148,7 +104,7 @@ impl Database {
         if self.len().await == 0 {
             return false;
         } else {
-            if self.records.remove(key).await.is_some() {
+            if self.records.remove(key).is_some() {
                 self.notify(key, None).await;
                 true
             } else {
@@ -157,7 +113,7 @@ impl Database {
         }
     }
     pub async fn get(&self, key: &Key) -> Option<Arc<Value>> {
-        Some(self.records.get(key).await?.value().value.clone())
+        Some(self.records.get(key)?.value().value.clone())
     }
 }
 
