@@ -94,6 +94,10 @@ impl Database {
         if !self.watchers.contains_key(&key) {
             false
         } else {
+            // let it = self.watchers.get(&key).unwrap().iter();
+            let w = self.watchers.get(&key).unwrap();
+     
+            // let w = Watcher::notify_coordinated(w.iter(), value).await;
             for wa in self.watchers.get(&key).unwrap().iter() {
                 wa.value().wake(value.clone());
             }

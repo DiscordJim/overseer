@@ -315,7 +315,10 @@ async fn decode_value_string<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Val
     ))
 }
 
-async fn read_key<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Key, NetworkError> {
+async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
+where 
+    R: AsyncRead + Unpin
+{
     // Check the key length, we will read this first before deferring.
     let key_buf = &mut [0u8; 4];
     let key_buf_size = socket.read_exact(key_buf).await?;
