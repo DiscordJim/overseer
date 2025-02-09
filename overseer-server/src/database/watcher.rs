@@ -1,21 +1,12 @@
 use std::{collections::VecDeque, marker::PhantomData, ops::Deref, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
-use dashmap::{iter::Iter, mapref::{multiple::RefMulti, one::Ref}};
 use overseer::{access::WatcherBehaviour, models::Value};
 use tokio::sync::Notify;
 
-use crate::net::ClientId;
 
 
 pub struct WatchServer;
 pub struct WatchClient;
-
-// TODO: Way to notify all watchers at the same time.
-
-
-
-// type EagerInner = Arc<>;
-// type OrderedInner = Arc<Mutex<VecDeque<Option<Arc<Value>>>>>;
 
 enum HoldingInner {
     /// An ordered watcher returns things in the order of

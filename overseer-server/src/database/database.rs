@@ -41,7 +41,7 @@ impl Database {
         self.notify(&key, Some(value)).await;
     }
 
-    pub async fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.records.len()
     }
     pub async fn subscribe<K>(&self, key: K, client_id: ClientId, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
@@ -74,13 +74,10 @@ impl Database {
     }
     pub async fn release<K: Into<Key>>(&self, key: K, id: ClientId) -> bool {
         let key = key.into();
-
-        // let value = self.watchers.get(&key.into()).await;
-
         if self.watchers.contains_key(&key) {
             let value = self.watchers.get(&key).unwrap();
-            if let Some((_, kille)) = value.remove(&id) {
-                kille.kill();
+            if let Some((_, killed)) = value.remove(&id) {
+                killed.kill();
                 true
             } else {
                 false
@@ -91,21 +88,16 @@ impl Database {
         }
     }
     pub async fn notify(&self, key: &Key, value: Option<Arc<Value>>) -> bool {
-        if !self.watchers.contains_key(&key) {
-            false
-        } else {
-            // let it = self.watchers.get(&key).unwrap().iter();
-            let w = self.watchers.get(&key).unwrap();
-     
-            // let w = Watcher::notify_coordinated(w.iter(), value).await;
-            for wa in self.watchers.get(&key).unwrap().iter() {
-                wa.value().wake(value.clone());
-            }
-            true
+        match self.watchers.get(key) {
+            Some(map) => {
+                Watcher::notify_coordinated(map.iter(), value);
+                true
+            },
+            None => false
         }
     }
     pub async fn delete(&self, key: &Key) -> bool {
-        if self.len().await == 0 {
+        if self.len() == 0 {
             return false;
         } else {
             if self.records.remove(key).is_some() {
@@ -141,27 +133,27 @@ mod tests {
         let key = Key::from_str("hello");
         db.insert(key.clone(), Value::Integer(12)).await;
 
-        assert_eq!(db.len().await, 1);
+        assert_eq!(db.len(), 1);
 
         assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 12);
         assert!(db.delete(&key).await);
         assert!(db.get(&key).await.is_none());
 
-        assert_eq!(db.len().await, 0);
+        assert_eq!(db.len(), 0);
 
         db.insert(key.clone(), Value::Integer(29)).await;
-        assert_eq!(db.len().await, 1);
+        assert_eq!(db.len(), 1);
         assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 29);
         db.insert(key.clone(), Value::Integer(30)).await;
-        assert_eq!(db.len().await, 1);
+        assert_eq!(db.len(), 1);
         assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 30);
 
         db.insert(Key::from_str("h2"), Value::Integer(13)).await;
-        assert_eq!(db.len().await, 2);
+        assert_eq!(db.len(), 2);
         assert_eq!(db.get(&Key::from_str("h2")).await.unwrap().as_integer().unwrap(), 13);
 
         assert!(db.delete(&Key::from_str("h2")).await);
-        assert_eq!(db.len().await, 1);
+        assert_eq!(db.len(), 1);
         
      
 
