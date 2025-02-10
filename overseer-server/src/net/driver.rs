@@ -1,7 +1,7 @@
 use std::{path::Path, sync::Arc};
 
 use dashmap::DashMap;
-use overseer::{error::NetworkError, models::Key, network::Packet};
+use overseer::{error::NetworkError, models::Key, network::{Packet, PacketId, PacketPayload}};
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -111,22 +111,22 @@ async fn handle_client_read(
 ) -> Result<(), NetworkError> {
     loop {
         let packet = Packet::read(&mut socket).await?;
-        match packet {
-            Packet::Insert { key, value } => {
+        match packet.payload() {
+            PacketPayload::Insert { key, value } => {
                 internal.database.insert(key.clone(), value.clone()).await?;
-                internal.send(ctx.id, Packet::Return { key, value: Some(value) }).await;
+                internal.send(ctx.id, Packet::vreturn(packet.id(), key, Some(value.to_owned()))).await;
             }
-            Packet::Get { key } => {
-                let value = { internal.database.get(&key).await }.map(|f| (*f).to_owned());
+            PacketPayload::Get { key } => {
+                let value = { internal.database.get(key).await }.map(|f| (*f).to_owned());
                 internal
-                    .send(ctx.id, Packet::Return { key, value })
+                    .send(ctx.id, Packet::vreturn(packet.id(), key, value))
                     .await;
             }
-            Packet::Delete { key } => {
-                internal.database.delete(&key).await?;
-                internal.send(ctx.id, Packet::get(key)).await;
+            PacketPayload::Delete { key } => {
+                internal.database.delete(key).await?;
+                internal.send(ctx.id, Packet::get(packet.id(), key.to_owned())).await;
             }
-            Packet::Watch {
+            PacketPayload::Watch {
                 key,
                 activity,
                 behaviour,
@@ -134,25 +134,26 @@ async fn handle_client_read(
                 let wow = Arc::new(
                     internal
                         .database
-                        .subscribe(key.clone(), ctx.id, behaviour, activity)
+                        .subscribe(key.clone(), ctx.id, *behaviour, *activity)
                         .await?,
                 );
                 ctx.watches.insert(key.clone(), Arc::clone(&wow));
                 tokio::spawn({
                     let internal = Arc::clone(&internal);
                     let ctx = Arc::clone(&ctx);
+                    let key = key.clone();
                     async move {
                         spawn_subscriber(key, wow, internal, ctx).await;
                     }
                 });
             }
-            Packet::Release { key } => {
+            PacketPayload::Release { key } => {
                 if let Some(..) = ctx.watches.remove(&key) {
                     internal.database.release(key.clone(), ctx.id).await?;
                 } else {
                     // Key not present.
                 }
-                internal.send(ctx.id, Packet::get(key)).await;
+                internal.send(ctx.id, Packet::get(packet.id(), key)).await;
             }
             _ => unimplemented!(),
         }
@@ -173,7 +174,7 @@ async fn spawn_subscriber(
             break;
         }
         internal
-            .send(ctx.id, Packet::notify(key.clone(), val, false))
+            .send(ctx.id, Packet::notify(PacketId::zero(), key.clone(), val, false))
             .await;
     }
 }
@@ -185,7 +186,7 @@ mod tests {
     use overseer::{
         access::{WatcherActivity, WatcherBehaviour},
         error::NetworkError,
-        models::{Key, Value}, network::Packet
+        models::{Key, Value}, network::{Packet, PacketId, PacketPayload}
     };
     use tokio::{
         net::TcpStream,
@@ -210,7 +211,7 @@ mod tests {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
 
                 // Configure a lazy watch on the brokers key.
-                Packet::watch(Key::from_str("brokers"), WatcherActivity::Lazy, WatcherBehaviour::Ordered)
+                Packet::watch(PacketId::zero(), Key::from_str("brokers"), WatcherActivity::Lazy, WatcherBehaviour::Ordered)
                     .write(&mut connect)
                     .await?;
 
@@ -219,33 +220,33 @@ mod tests {
                 });
 
                 // Let us wait until this gets inserted.
-                if let Packet::Notify { key, value, .. } = Packet::read(&mut connect).await? {
+                if let PacketPayload::Notify { key, value, .. } = Packet::read(&mut connect).await?.payload() {
                     assert_eq!(key.as_str(), "brokers");
-                    assert_eq!(value.unwrap().as_integer().unwrap(), 145);
+                    assert_eq!(value.as_ref().unwrap().as_integer().unwrap(), 145);
                 } else {
                     panic!("Expected notify, received other type.");
                 }
 
                 // Let us wait until this gets updated.
-                if let Packet::Notify { key, value, .. } = Packet::read(&mut connect).await? {
+                if let PacketPayload::Notify { key, value, .. } = Packet::read(&mut connect).await?.payload() {
                     assert_eq!(key.as_str(), "brokers");
-                    assert_eq!(value.unwrap().as_integer().unwrap(), 28);
+                    assert_eq!(value.as_ref().unwrap().as_integer().unwrap(), 28);
                 } else {
                     panic!("Expected notify, received other type.");
                 }
 
                 // Let us wait until this gets inserted.
-                if let Packet::Notify { key, value, .. } = Packet::read(&mut connect).await? {
+                if let PacketPayload::Notify { key, value, .. } = Packet::read(&mut connect).await?.payload() {
                     assert_eq!(key.as_str(), "brokers");
-                    assert_eq!(value, None);
+                    assert_eq!(*value, None);
                 } else {
                     panic!("Expected notify, received other type.");
                 }
 
                 //
 
-                Packet::release("brokers").write(&mut connect).await?;
-                matches!(Packet::read(&mut connect).await?, Packet::Get { .. });
+                Packet::release(PacketId::zero(), Key::from_str("brokers")).write(&mut connect).await?;
+                matches!(Packet::read(&mut connect).await?.payload(), PacketPayload::Get { .. });
 
                 staging2.wait().await;
 
@@ -262,13 +263,13 @@ mod tests {
                 staging.wait().await;
 
                 // Configure a lazy watch on the brokers key.
-                Packet::insert(Key::from_str("brokers"), 145).write(&mut connect).await?;
-                Packet::insert(Key::from_str("brokers"), 28).write(&mut connect).await?;
-                Packet::delete(Key::from_str("brokers")).write(&mut connect).await?;
+                Packet::insert(PacketId::zero(), Key::from_str("brokers"), Value::Integer(145)).write(&mut connect).await?;
+                Packet::insert(PacketId::zero(), Key::from_str("brokers"), Value::Integer(28)).write(&mut connect).await?;
+                Packet::delete(PacketId::zero(), Key::from_str("brokers")).write(&mut connect).await?;
 
                 staging2.wait().await;
 
-                Packet::insert(Key::from_str("brokers"), 13).write(&mut connect).await?;
+                Packet::insert(PacketId::zero(), Key::from_str("brokers"), Value::Integer(13)).write(&mut connect).await?;
 
                 Ok::<(), NetworkError>(())
             }
@@ -288,51 +289,54 @@ mod tests {
             async move {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
 
-                Packet::Insert {
-                    key: Key::from_str("hello"),
-                    value: Value::Integer(62),
-                }
-                .write(&mut connect)
-                .await?;
+                Packet::insert(PacketId::zero(), Key::from_str("hello"), Value::Integer(62)).write(&mut connect).await?;
+                // Packet::Insert {
+                //     key: Key::from_str("hello"),
+                //     value: Value::Integer(62),
+                // }
+                // .write(&mut connect)
+                // .await?;
 
-                match Packet::read(&mut connect).await? {
-                    Packet::Return { .. } => {},
+                match Packet::read(&mut connect).await?.payload() {
+                    PacketPayload::Return { .. } => {},
                     packet => { panic!("Expected a return packet but received packet {:?}", packet) }
                 }
                 
 
                 // matches!(packet, Packet::Get { .. });
 
-                Packet::Get {
-                    key: Key::from_str("hello"),
-                }
-                .write(&mut connect)
-                .await?;
+                // Packet::Get {
+                //     key: Key::from_str("hello"),
+                // }
+                // .write(&mut connect)
+                // .await?;
 
-                if let Packet::Return { key, value } = Packet::read(&mut connect).await? {
+                Packet::get(PacketId::zero(), Key::from_str("hello")).write(&mut connect).await?;
+
+                if let PacketPayload::Return { key, value } = Packet::read(&mut connect).await?.payload() {
                     assert_eq!(key.as_str(), "hello");
-                    assert_eq!(value.unwrap().as_integer().unwrap(), 62);
+                    assert_eq!(value.as_ref().unwrap().as_integer().unwrap(), 62);
                 } else {
                     panic!("Incorrect packet type.");
                 }
 
                 // Try deleting a key.
-                Packet::delete(Key::from_str("hello"))
+                Packet::delete(PacketId::zero(), Key::from_str("hello"))
                     .write(&mut connect)
                     .await?;
-                match Packet::read(&mut connect).await? {
-                    Packet::Get { .. } => {},
+                match Packet::read(&mut connect).await?.payload() {
+                    PacketPayload::Get { .. } => {},
                     packet => { panic!("Expected a get packet but received packet {:?}", packet) }
                 }
                
 
                 // Get the key back, should be deleted.
-                Packet::get(Key::from_str("hello"))
+                Packet::get(PacketId::zero(), Key::from_str("hello"))
                     .write(&mut connect)
                     .await?;
-                if let Packet::Return { key, value } = Packet::read(&mut connect).await? {
+                if let PacketPayload::Return { key, value } = Packet::read(&mut connect).await?.payload() {
                     assert_eq!(key.as_str(), "hello");
-                    assert_eq!(value, None);
+                    assert_eq!(*value, None);
                 } else {
                     panic!("Incorrect packet type.");
                 }

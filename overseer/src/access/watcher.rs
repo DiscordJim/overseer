@@ -1,6 +1,6 @@
 use crate::error::NetworkError;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum WatcherBehaviour {
     /// Watcher returns values in order
     Ordered,
@@ -30,7 +30,7 @@ impl TryFrom<u8> for WatcherActivity {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum WatcherActivity {
     /// Kicks the initial state back to the watcher immediately.
     Kickback,
