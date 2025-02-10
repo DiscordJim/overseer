@@ -2,4 +2,5 @@
 resolver = "2"
 members = [ "overseer", "overseer-client","overseer-server"
 
-]
+, "tests"]
+

@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+
+
 #[derive(Error, Debug)]
 pub enum NetworkError {
     #[error("Failed to connect to address.")]
@@ -23,5 +25,17 @@ pub enum NetworkError {
     #[error("Could not decode boolean")]
     ErrorDecodingBoolean,
     #[error("Unknown packet schema")]
-    UnknownPacketSchema(u8)
+    UnknownPacketSchema(u8),
+    #[error("Storage error")]
+    StorageError(#[from] sqlx::error::Error),
+    #[error("Could not conver from slice")]
+    TrySliceError(#[from] std::array::TryFromSliceError),
+    #[error("Could not convert from slice")]
+    ParseUtf8Error(#[from] std::str::Utf8Error),
+    #[error("Error converting to socket")]
+    SocketError,
+    #[error("Failed to connect to the socket")]
+    FailedToConnectToSocket,
+    #[error("Wrong response from server")]
+    WrongResponseFromServer
 }

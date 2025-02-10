@@ -1,0 +1,13 @@
+[package]
+name = "tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.43.0", features = ["full"] }
+overseer = { path = "../overseer" }
+overseer-server = { path = "../overseer-server" }
+overseer-client = { path = "../overseer-client" }
+
+[dev-dependencies]
+tempfile = "3.16.0"

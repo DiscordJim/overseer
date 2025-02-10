@@ -187,4 +187,18 @@ mod tests {
         assert_eq!(client_2.wait().await.unwrap().as_integer().unwrap(), 45);
         
     }
+
+    /// This test checks if notifications actually work.
+    #[tokio::test]
+    pub async fn check_watcher_notify_integrity() {
+        let (client_1, server_1) = Watcher::new(WatcherBehaviour::Eager);
+        server_1.wake_without_notify(Some(Arc::new(Value::Integer(2))));
+        assert_eq!(client_1.wait().await.unwrap().as_integer().unwrap(), 2);
+
+        server_1.wake(Some(Arc::new(Value::Integer(4))));
+        assert_eq!(client_1.wait().await.unwrap().as_integer().unwrap(), 4);
+
+    }
+
+
 }

@@ -27,7 +27,7 @@ where
         } => write_watch_packet(key, activity, behaviour, socket).await,
         Packet::Delete { key } => write_delete_packet(key, socket).await,
         Packet::Notify { key, value, more } => write_notify_packet(key, value, *more, socket).await,
-        Packet::GetReturn { key, value } => write_getreturn_packet(key, value, socket).await,
+        Packet::Return { key, value } => write_getreturn_packet(key, value, socket).await,
     }
 }
 
@@ -132,7 +132,7 @@ where
 {
     Ok(match reader.read_u8().await? {
         0 => None,
-        1 => Some(decode_value(reader).await?),
+        1 => Some(read_value(reader).await?),
         _ => Err(NetworkError::ErrorDecodingOption)?,
     })
 }
@@ -160,7 +160,7 @@ async fn write_insert_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn write_value<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_value<W: AsyncWriteExt + Unpin>(
     value: &Value,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
@@ -215,7 +215,7 @@ async fn write_release_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn write_key<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_key<W: AsyncWriteExt + Unpin>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
@@ -234,7 +234,7 @@ async fn read_getreturn_packet<R: AsyncRead + Unpin>(
 ) -> Result<Packet, NetworkError> {
     let key = read_key(socket).await?;
     let value = read_optional_value(socket).await?;
-    Ok(Packet::GetReturn { key, value })
+    Ok(Packet::Return { key, value })
 }
 /// Reads a packet of the set type.
 async fn read_notify_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
@@ -265,7 +265,7 @@ async fn read_get_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet,
 /// Reads a packet of the set type.
 async fn read_set_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packet, NetworkError> {
     let key = read_key(socket).await?;
-    let value = decode_value(socket).await?;
+    let value = read_value(socket).await?;
     Ok(Packet::Insert { key, value })
 }
 
@@ -281,7 +281,7 @@ async fn read_watch_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Packe
     })
 }
 
-async fn decode_value<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Value, NetworkError> {
+pub(crate) async fn read_value<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Value, NetworkError> {
     let type_discrim = socket.read_u8().await?;
     match type_discrim {
         0 => decode_value_string(socket).await,
@@ -315,7 +315,7 @@ async fn decode_value_string<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Val
     ))
 }
 
-async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
+pub(crate) async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
 where 
     R: AsyncRead + Unpin
 {

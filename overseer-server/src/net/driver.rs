@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
+use dashmap::DashMap;
 use overseer::{error::NetworkError, models::Key, network::Packet};
 use tokio::{
     net::{
@@ -8,12 +9,12 @@ use tokio::{
     },
     sync::mpsc::{Receiver, Sender},
 };
-use whirlwind::ShardMap;
+
 
 use crate::database::{Database, WatchClient, Watcher};
 
 pub struct Driver {
-    internal: Arc<DriverInternal>,
+    internal: Arc<DriverInternal>
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,22 +29,27 @@ impl ClientId {
 struct DriverInternal {
     database: Database,
     stream: TcpListener,
-    write_queue: Arc<ShardMap<ClientId, Sender<Packet>>>,
+    write_queue: DashMap<ClientId, Sender<Packet>>
 }
 
 impl DriverInternal {
     pub async fn send(&self, id: ClientId, packet: Packet) {
-        let queue = self.write_queue.get(&id).await.unwrap().value().clone();
+        let queue = self.write_queue.get(&id).unwrap().value().clone();
         queue.send(packet).await.unwrap();
     }
 }
 
 impl Driver {
-    pub async fn start<A: ToSocketAddrs>(addr: A) -> Result<Self, NetworkError> {
+    pub async fn start<A, P, S>(addr: A, path: P, name: S) -> Result<Self, NetworkError>
+    where 
+        A: ToSocketAddrs,
+        P: AsRef<Path>,
+        S: AsRef<str>
+    {
         let internal = Arc::new(DriverInternal {
-            database: Database::new(),
+            database: Database::new(path, name).await?,
             stream: TcpListener::bind(addr).await?,
-            write_queue: ShardMap::new().into(),
+            write_queue: DashMap::new(),
         });
 
         tokio::spawn(accept_connection_loop(Arc::clone(&internal)));
@@ -74,10 +80,10 @@ async fn handle_client(
     println!("Spawning new client...");
     let (read, write) = socket.into_split();
     let (sender, receiver) = tokio::sync::mpsc::channel(250);
-    internal.write_queue.insert(id, sender).await;
+    internal.write_queue.insert(id, sender);
     let ctx = Arc::new(ClientContext {
         id,
-        watches: ShardMap::new(),
+        watches: DashMap::new(),
     });
     tokio::spawn(handle_client_write(write, receiver));
     tokio::spawn(handle_client_read(read, internal, ctx));
@@ -85,7 +91,7 @@ async fn handle_client(
 
 struct ClientContext {
     id: ClientId,
-    watches: ShardMap<Key, Arc<Watcher<WatchClient>>>,
+    watches: DashMap<Key, Arc<Watcher<WatchClient>>>,
 }
 
 async fn handle_client_write(
@@ -107,17 +113,17 @@ async fn handle_client_read(
         let packet = Packet::read(&mut socket).await?;
         match packet {
             Packet::Insert { key, value } => {
-                internal.database.insert(key.clone(), value).await;
-                internal.send(ctx.id, Packet::Get { key }).await;
+                internal.database.insert(key.clone(), value.clone()).await?;
+                internal.send(ctx.id, Packet::Return { key, value: Some(value) }).await;
             }
             Packet::Get { key } => {
                 let value = { internal.database.get(&key).await }.map(|f| (*f).to_owned());
                 internal
-                    .send(ctx.id, Packet::GetReturn { key, value })
+                    .send(ctx.id, Packet::Return { key, value })
                     .await;
             }
             Packet::Delete { key } => {
-                internal.database.delete(&key).await;
+                internal.database.delete(&key).await?;
                 internal.send(ctx.id, Packet::get(key)).await;
             }
             Packet::Watch {
@@ -129,9 +135,9 @@ async fn handle_client_read(
                     internal
                         .database
                         .subscribe(key.clone(), ctx.id, behaviour, activity)
-                        .await,
+                        .await?,
                 );
-                ctx.watches.insert(key.clone(), Arc::clone(&wow)).await;
+                ctx.watches.insert(key.clone(), Arc::clone(&wow));
                 tokio::spawn({
                     let internal = Arc::clone(&internal);
                     let ctx = Arc::clone(&ctx);
@@ -141,8 +147,8 @@ async fn handle_client_read(
                 });
             }
             Packet::Release { key } => {
-                if let Some(..) = ctx.watches.remove(&key).await {
-                    internal.database.release(key.clone(), ctx.id).await;
+                if let Some(..) = ctx.watches.remove(&key) {
+                    internal.database.release(key.clone(), ctx.id).await?;
                 } else {
                     // Key not present.
                 }
@@ -190,7 +196,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn test_client_subscription() {
-        let server = Driver::start("127.0.0.1:0").await.unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let server = Driver::start("127.0.0.1:0", td.path(), "db").await.unwrap();
 
         let staging = Arc::new(Barrier::new(2));
         let staging2 = Arc::new(Barrier::new(2));
@@ -203,7 +210,7 @@ mod tests {
                 let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
 
                 // Configure a lazy watch on the brokers key.
-                Packet::watch("brokers", WatcherActivity::Lazy, WatcherBehaviour::Ordered)
+                Packet::watch(Key::from_str("brokers"), WatcherActivity::Lazy, WatcherBehaviour::Ordered)
                     .write(&mut connect)
                     .await?;
 
@@ -255,25 +262,26 @@ mod tests {
                 staging.wait().await;
 
                 // Configure a lazy watch on the brokers key.
-                Packet::insert("brokers", 145).write(&mut connect).await?;
-                Packet::insert("brokers", 28).write(&mut connect).await?;
-                Packet::delete("brokers").write(&mut connect).await?;
+                Packet::insert(Key::from_str("brokers"), 145).write(&mut connect).await?;
+                Packet::insert(Key::from_str("brokers"), 28).write(&mut connect).await?;
+                Packet::delete(Key::from_str("brokers")).write(&mut connect).await?;
 
                 staging2.wait().await;
 
-                Packet::insert("brokers", 13).write(&mut connect).await?;
+                Packet::insert(Key::from_str("brokers"), 13).write(&mut connect).await?;
 
                 Ok::<(), NetworkError>(())
             }
         });
 
-        let _ = handle.await.unwrap();
-        let _ = handle2.await.unwrap();
+        handle.await.unwrap().unwrap();
+        handle2.await.unwrap().unwrap();
     }
 
     #[tokio::test]
     pub async fn test_client_basic() {
-        let server = Driver::start("127.0.0.1:0").await.unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let server = Driver::start("127.0.0.1:0", td.path(), "db").await.unwrap();
 
         let handle = tokio::spawn({
             let port = server.port();
@@ -287,8 +295,13 @@ mod tests {
                 .write(&mut connect)
                 .await?;
 
-                let packet = Packet::read(&mut connect).await?;
-                matches!(packet, Packet::Get { .. });
+                match Packet::read(&mut connect).await? {
+                    Packet::Return { .. } => {},
+                    packet => { panic!("Expected a return packet but received packet {:?}", packet) }
+                }
+                
+
+                // matches!(packet, Packet::Get { .. });
 
                 Packet::Get {
                     key: Key::from_str("hello"),
@@ -296,7 +309,7 @@ mod tests {
                 .write(&mut connect)
                 .await?;
 
-                if let Packet::GetReturn { key, value } = Packet::read(&mut connect).await? {
+                if let Packet::Return { key, value } = Packet::read(&mut connect).await? {
                     assert_eq!(key.as_str(), "hello");
                     assert_eq!(value.unwrap().as_integer().unwrap(), 62);
                 } else {
@@ -307,13 +320,17 @@ mod tests {
                 Packet::delete(Key::from_str("hello"))
                     .write(&mut connect)
                     .await?;
-                matches!(Packet::read(&mut connect).await?, Packet::Delete { .. });
+                match Packet::read(&mut connect).await? {
+                    Packet::Get { .. } => {},
+                    packet => { panic!("Expected a get packet but received packet {:?}", packet) }
+                }
+               
 
                 // Get the key back, should be deleted.
                 Packet::get(Key::from_str("hello"))
                     .write(&mut connect)
                     .await?;
-                if let Packet::GetReturn { key, value } = Packet::read(&mut connect).await? {
+                if let Packet::Return { key, value } = Packet::read(&mut connect).await? {
                     assert_eq!(key.as_str(), "hello");
                     assert_eq!(value, None);
                 } else {
@@ -324,6 +341,6 @@ mod tests {
             }
         });
 
-        let _ = handle.await.unwrap();
+        handle.await.unwrap().unwrap();
     }
 }

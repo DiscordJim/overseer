@@ -1,4 +1,6 @@
-use crate::error::ValueParseError;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use crate::{error::{NetworkError, ValueParseError}, network::decoder::{read_value, write_value}};
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Value {
@@ -8,10 +10,36 @@ pub enum Value {
 
 
 impl Value {
+    pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
+    where 
+        W: AsyncWrite + Unpin
+    {
+        write_value(self, writer).await
+    }
+    pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
+    where 
+        R: AsyncRead + Unpin
+    {
+        read_value(reader).await
+    }
+    // pub fn from_discriminator(id: u8, bytes: &[u8]) -> Result<Self, NetworkError> {
+    //     Ok(match id {
+    //         0 => S
+    //     })
+    // }
+    
     pub fn discriminator(&self) -> u8 {
         match self {
             Self::String(..) => 0,
             Self::Integer(..) => 1
+        }
+    }
+    pub fn decode(discrim: u8, bytes: &[u8]) -> Result<Self, NetworkError> {
+    
+        match discrim {
+            0 => Ok(Self::String(std::str::from_utf8(bytes)?.to_string())),
+            1 => Ok(Self::Integer(i64::from_le_bytes(bytes.try_into()?))),
+            x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x))
         }
     }
     pub fn type_name(&self) -> &'static str {
@@ -32,6 +60,12 @@ impl Value {
             Ok(*s)
         } else {
             Err(ValueParseError::IncorrectType(format!("Tried to parse as integer but was {}.", self.type_name())))
+        }
+    }
+    pub fn as_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Integer(i) => i.to_le_bytes().to_vec(),
+            Self::String(s) => s.as_bytes().to_vec()
         }
     }
 }

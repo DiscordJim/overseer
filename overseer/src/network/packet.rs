@@ -1,3 +1,5 @@
+use std::borrow::Borrow;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}};
@@ -31,7 +33,7 @@ pub enum Packet {
         value: Option<Value>,
         more: bool
     },
-    GetReturn {
+    Return {
         key: Key,
         value: Option<Value>
     }
@@ -46,17 +48,17 @@ impl Packet {
     pub fn release<K: Into<Key>>(key: K) -> Self {
         Self::Release { key: key.into() }
     }
-    pub fn watch<K: Into<Key>>(key: K, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Self {
-        Self::Watch { key: key.into(), activity, behaviour }
+    pub fn watch<K: Borrow<Key>>(key: K, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Self {
+        Self::Watch { key: key.borrow().to_owned(), activity, behaviour }
     }
-    pub fn insert<K: Into<Key>, V: Into<Value>>(key: K, value: V) -> Self {
-        Self::Insert { key: key.into(), value: value.into() }
+    pub fn insert<K: Borrow<Key>, V: Into<Value>>(key: K, value: V) -> Self {
+        Self::Insert { key: key.borrow().to_owned(), value: value.into() }
     }
-    pub fn delete<K: Into<Key>>(key: K) -> Self {
-        Self::Delete { key: key.into() }
+    pub fn delete<K: Borrow<Key>>(key: K) -> Self {
+        Self::Delete { key: key.borrow().to_owned() }
     }
-    pub fn get<K: Into<Key>>(key: K) -> Self {
-        Self::Get { key: key.into() }
+    pub fn get<K: Borrow<Key>>(key: K) -> Self {
+        Self::Get { key: key.borrow().to_owned() }
     }
     pub fn discriminator(&self) -> u8 {
         match self {
@@ -66,7 +68,7 @@ impl Packet {
             Self::Release { .. } => 3,
             Self::Delete { .. } => 4,
             Self::Notify { .. } => 5,
-            Self::GetReturn { .. } => 6
+            Self::Return { .. } => 6
         }
     }
     pub async fn write<W: AsyncWriteExt + Unpin>(&self, writer: &mut W) -> Result<(), NetworkError> {
