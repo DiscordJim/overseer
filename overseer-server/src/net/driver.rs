@@ -138,6 +138,7 @@ async fn handle_client_read(
                         .await?,
                 );
                 ctx.watches.insert(key.clone(), Arc::clone(&wow));
+                
                 tokio::spawn({
                     let internal = Arc::clone(&internal);
                     let ctx = Arc::clone(&ctx);
@@ -146,6 +147,7 @@ async fn handle_client_read(
                         spawn_subscriber(key, wow, internal, ctx).await;
                     }
                 });
+                internal.send(ctx.id, Packet::get(packet.id(), key.to_owned())).await;
             }
             PacketPayload::Release { key } => {
                 if let Some(..) = ctx.watches.remove(&key) {
@@ -214,6 +216,13 @@ mod tests {
                 Packet::watch(PacketId::zero(), Key::from_str("brokers"), WatcherActivity::Lazy, WatcherBehaviour::Ordered)
                     .write(&mut connect)
                     .await?;
+                // Let us wait until this gets inserted.
+                if let PacketPayload::Get { key, .. } = Packet::read(&mut connect).await?.payload() {
+                    assert_eq!(key.as_str(), "brokers");
+                    // assert_eq!(value.as_ref().unwrap().as_integer().unwrap(), 145);
+                } else {
+                    panic!("Expected notify, received other type.");
+                }
 
                 tokio::spawn(async move {
                     staging.wait().await;

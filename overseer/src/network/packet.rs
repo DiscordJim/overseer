@@ -8,12 +8,13 @@ use super::decoder::{read_packet, write_packet};
 
 pub const CURRENT_VERSION: u8 = 0;
 
+#[derive(Debug)]
 pub struct Packet {
     id: PacketId,
     payload: PacketPayload 
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct PacketId(u32, u32);
 
 impl PacketId {
