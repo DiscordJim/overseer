@@ -69,4 +69,31 @@ mod tests {
         assert_eq!(link.wait_on_update().await, Some(Value::Integer(2)));
         assert_eq!(link.wait_on_update().await, None);
     }
+
+    #[tokio::test]
+    pub async fn test_client_connection_breakoff() {
+        let td = tempfile::tempdir().unwrap();
+
+        let driver = Driver::start("127.0.0.1:0", td.path(), "db").await.unwrap();
+        let port = driver.port();
+
+        // Launch a client, verify it starts off as none.
+        let client = Client::new(format!("127.0.0.1:{port}")).await.unwrap();
+        assert!(client.get(Key::from_str("hello")).await.unwrap().is_none());
+
+        // Insert the key.
+        client.insert(Key::from_str("hello"), Value::Integer(23)).await.unwrap();
+        assert_eq!(client.get(Key::from_str("hello")).await.unwrap().unwrap(), Value::Integer(23));
+
+        client.reset_connection().await.unwrap();
+
+        // Insert the key.
+        client.insert(Key::from_str("hello"), Value::Integer(25)).await.unwrap();
+        assert_eq!(client.get(Key::from_str("hello")).await.unwrap().unwrap(), Value::Integer(25));
+
+        // Delete the key.
+        client.delete(Key::from_str("hello")).await.unwrap();
+        assert!(client.get(Key::from_str("hello")).await.unwrap().is_none());
+
+    }
 }

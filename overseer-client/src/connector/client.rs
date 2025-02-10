@@ -1,10 +1,10 @@
-use std::{borrow::Borrow, net::{SocketAddr, ToSocketAddrs}, sync::{atomic::{AtomicU32, Ordering}, Arc}};
+use std::{borrow::Borrow, net::{SocketAddr, ToSocketAddrs}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc}};
 
 use dashmap::DashMap;
 use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}, network::{Packet, PacketId, PacketPayload}};
 use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{oneshot::Sender, Mutex, Notify}};
 
-
+use tokio::io::AsyncWriteExt;
 #[derive(Clone)]
 pub struct LiveValue {
     value: Arc<LiveValueInternal>,
@@ -13,7 +13,6 @@ pub struct LiveValue {
 
 
 impl LiveValue {
-
     pub async fn get(&self) -> Option<Value> {
         self.value.value.lock().await.clone()
     }
@@ -34,7 +33,7 @@ pub struct Client {
 }
 
 struct Inner {
-    write: Mutex<Option<OwnedWriteHalf>>,
+    write: Mutex<Option<(OwnedWriteHalf, Arc<Notify>)>>,
     counter: AtomicU32,
     signal: Notify,
     channels: DashMap<u32, Sender<Packet>>,
@@ -44,14 +43,23 @@ struct Inner {
 
 
 
-async fn run_client_backend(mut read: OwnedReadHalf, inner: Arc<Inner>) -> Result<(), NetworkError>
-{
 
+
+async fn run_client_backend(mut read: OwnedReadHalf, kill: Arc<Notify>, inner: Arc<Inner>) -> Result<(), NetworkError>
+{
 
     inner.signal.notify_waiters();
 
     loop {
-        let packet = Packet::read(&mut read).await?;
+
+        let packet = tokio::select! {
+            e = Packet::read(&mut read) => {
+                e
+            },
+            _ = kill.notified() => {
+                break;
+            }
+        }?;
         let packet_id = packet.id();
 
  
@@ -67,6 +75,9 @@ async fn run_client_backend(mut read: OwnedReadHalf, inner: Arc<Inner>) -> Resul
         }
 
     }
+    println!("Hello broken");
+
+    Ok(())
 }
 
 impl Client {
@@ -88,20 +99,33 @@ impl Client {
             })
         })
     }
+    pub async fn reset_connection(&self) -> Result<(), NetworkError> {
+        if let Some((a, kill)) = &mut *self.inner.write.lock().await {
+            a.shutdown().await?;
+            kill.notify_waiters();
+        }
+        *self.inner.write.lock().await = None;
+        Ok(())
+
+    }
     async fn connect(&self) -> Result<(), NetworkError> {
+        println!("CONNECT");
         if self.inner.write.lock().await.is_none() {
             let (read, write) = TcpStream::connect(self.address).await?.into_split();
-            tokio::spawn(run_client_backend(read, Arc::clone(&self.inner)));
+
+            let notif = Arc::new(Notify::new());
+
+            tokio::spawn(run_client_backend(read, notif.clone(), Arc::clone(&self.inner)));
             
             self.inner.signal.notified().await;
-            *self.inner.write.lock().await = Some(write);
+            *self.inner.write.lock().await = Some((write, notif));
             
         }
         Ok(())
     }
     async fn send(&self, packet: Packet) -> Result<Packet, NetworkError> {
         let mut handle = self.inner.write.lock().await;
-        let stream = handle.as_mut().unwrap();
+        let (stream, _) = handle.as_mut().unwrap();
 
 
         let (sdr, rcv) = tokio::sync::oneshot::channel::<Packet>();
@@ -153,6 +177,7 @@ impl Client {
         // } else {
         //     return Err(NetworkError::WrongResponseFromServer);
         // }
+        println!("Hello");
         let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::insert(key, value));
         if let PacketPayload::Return { value, .. } = self.send(packet).await?.payload() {
             return Ok(value.clone());
