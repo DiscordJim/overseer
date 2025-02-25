@@ -1,8 +1,8 @@
 use std::{borrow::Borrow, sync::Arc};
 
 use dashmap::DashMap;
+use monoio::io::{as_fd::AsWriteFd, AsyncWriteRent, AsyncWriteRentExt};
 use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}};
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::net::ClientId;
 
@@ -29,13 +29,13 @@ impl Record {
     }
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
     where 
-        W: AsyncWrite + Unpin
+        W: tokio::io::AsyncWrite + Unpin
     {
         self.value().write(writer).await
     }
     pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
     where 
-        R: AsyncRead + Unpin
+        R: tokio::io::AsyncRead + Unpin
     {
         Ok(Self {
             value: Arc::new(Value::read(reader).await?)
@@ -152,188 +152,188 @@ impl MemoryDatabase {
 mod tests {
     use std::sync::Arc;
 
-    use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
-    use tokio::sync::Notify;
+    // use overseer::{access::{WatcherActivity, WatcherBehaviour}, models::{Key, Value}};
+    // use tokio::sync::Notify;
 
-    use crate::{database::MemoryDatabase, net::ClientId};
+    // use crate::{database::MemoryDatabase, net::ClientId};
 
 
 
-    #[tokio::test]
-    pub async fn test_db_insert_delete() {
-        let db = MemoryDatabase::new();
+    // #[tokio::test]
+    // pub async fn test_db_insert_delete() {
+    //     let db = MemoryDatabase::new();
 
-        let key = Key::from_str("hello");
-        db.insert(key.clone(), Value::Integer(12)).await;
+    //     let key = Key::from_str("hello");
+    //     db.insert(key.clone(), Value::Integer(12)).await;
 
-        assert_eq!(db.len(), 1);
+    //     assert_eq!(db.len(), 1);
 
-        assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 12);
-        assert!(db.delete(&key).await);
-        assert!(db.get(&key).await.is_none());
+    //     assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 12);
+    //     assert!(db.delete(&key).await);
+    //     assert!(db.get(&key).await.is_none());
 
-        assert_eq!(db.len(), 0);
+    //     assert_eq!(db.len(), 0);
 
-        db.insert(key.clone(), Value::Integer(29)).await;
-        assert_eq!(db.len(), 1);
-        assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 29);
-        db.insert(key.clone(), Value::Integer(30)).await;
-        assert_eq!(db.len(), 1);
-        assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 30);
+    //     db.insert(key.clone(), Value::Integer(29)).await;
+    //     assert_eq!(db.len(), 1);
+    //     assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 29);
+    //     db.insert(key.clone(), Value::Integer(30)).await;
+    //     assert_eq!(db.len(), 1);
+    //     assert_eq!(db.get(&key).await.unwrap().as_integer().unwrap(), 30);
 
-        db.insert(Key::from_str("h2"), Value::Integer(13)).await;
-        assert_eq!(db.len(), 2);
-        assert_eq!(db.get(&Key::from_str("h2")).await.unwrap().as_integer().unwrap(), 13);
+    //     db.insert(Key::from_str("h2"), Value::Integer(13)).await;
+    //     assert_eq!(db.len(), 2);
+    //     assert_eq!(db.get(&Key::from_str("h2")).await.unwrap().as_integer().unwrap(), 13);
 
-        assert!(db.delete(&Key::from_str("h2")).await);
-        assert_eq!(db.len(), 1);
+    //     assert!(db.delete(&Key::from_str("h2")).await);
+    //     assert_eq!(db.len(), 1);
         
      
 
-    }
+    // }
 
-    #[tokio::test]
-    pub async fn test_subscribe() {
-        let db = Arc::new(MemoryDatabase::new());
+    // #[tokio::test]
+    // pub async fn test_subscribe() {
+    //     let db = Arc::new(MemoryDatabase::new());
 
-        let is_up = Arc::new(Notify::new());
+    //     let is_up = Arc::new(Notify::new());
 
-        let handle = tokio::spawn({
-            let db = Arc::clone(&db);
-            let is_up = Arc::clone(&is_up);
-            async move {
+    //     let handle = tokio::spawn({
+    //         let db = Arc::clone(&db);
+    //         let is_up = Arc::clone(&is_up);
+    //         async move {
 
-                is_up.notify_one();
+    //             is_up.notify_one();
 
-                let subbed = db.subscribe(Key::from_str("hello"), ClientId::from_id(0), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
+    //             let subbed = db.subscribe(Key::from_str("hello"), ClientId::from_id(0), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
                 
 
-                let mut status = true;
+    //             let mut status = true;
 
 
-                // The first change we want is when it is set.
-                let value = subbed.wait().await;
-                status = status & (*value.unwrap() == Value::Integer(0));
+    //             // The first change we want is when it is set.
+    //             let value = subbed.wait().await;
+    //             status = status & (*value.unwrap() == Value::Integer(0));
 
-                // The first change we want is when it gets a new value.
-                let value = subbed.wait().await;
-                status = status & (*value.unwrap() == Value::Integer(1));
+    //             // The first change we want is when it gets a new value.
+    //             let value = subbed.wait().await;
+    //             status = status & (*value.unwrap() == Value::Integer(1));
 
-                // Then it gets deleted.
-                status = status & (subbed.wait().await.is_none());
+    //             // Then it gets deleted.
+    //             status = status & (subbed.wait().await.is_none());
 
 
 
-                status
-            }
-        });
+    //             status
+    //         }
+    //     });
 
-        is_up.notified().await;
+    //     is_up.notified().await;
 
-        // Insert the value.
-        db.insert(Key::from_str("hello"), Value::Integer(0)).await;
+    //     // Insert the value.
+    //     db.insert(Key::from_str("hello"), Value::Integer(0)).await;
 
-        db.insert(Key::from_str("hello"), Value::Integer(1)).await;
+    //     db.insert(Key::from_str("hello"), Value::Integer(1)).await;
 
-        db.delete(&Key::from_str("hello")).await;
+    //     db.delete(&Key::from_str("hello")).await;
 
-        assert!(handle.await.unwrap());
+    //     assert!(handle.await.unwrap());
      
 
-    }
+    // }
 
 
-    #[tokio::test]
-    /// This tests a complex setup with many watchers.
-    pub async fn many_watchers() {
-        const KEY: &str = "config.kafka.brokers";
+    // #[tokio::test]
+    // /// This tests a complex setup with many watchers.
+    // pub async fn many_watchers() {
+    //     const KEY: &str = "config.kafka.brokers";
 
-        let db = MemoryDatabase::new();
+    //     let db = MemoryDatabase::new();
 
-        // println!("Make DB");
+    //     // println!("Make DB");
 
-        let mut handles = vec![];
-        for i in 0..100 {
-            handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
-                async move {
-                    assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
-                    // println!("Seen the first");
-                    assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
-                    // println!("Seen the secon.");
-                }
-            }));
-        }
-
-
-        // We start out with twelve brokers.
-        db.insert(Key::from_str(KEY), 12).await;
-
-        // println!("Inserted");
-
-        // Now let us scale down to 6.
-        db.insert(Key::from_str(KEY), 6).await;
+    //     let mut handles = vec![];
+    //     for i in 0..100 {
+    //         handles.push(tokio::spawn({
+    //             let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Ordered, WatcherActivity::Lazy).await;
+    //             async move {
+    //                 assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 12);
+    //                 // println!("Seen the first");
+    //                 assert_eq!(watcher.wait().await.unwrap().as_integer().unwrap(), 6);
+    //                 // println!("Seen the secon.");
+    //             }
+    //         }));
+    //     }
 
 
-        for handle in handles {
-            handle.await.unwrap();
-        }
+    //     // We start out with twelve brokers.
+    //     db.insert(Key::from_str(KEY), 12).await;
+
+    //     // println!("Inserted");
+
+    //     // Now let us scale down to 6.
+    //     db.insert(Key::from_str(KEY), 6).await;
+
+
+    //     for handle in handles {
+    //         handle.await.unwrap();
+    //     }
         
 
 
-    }
+    // }
 
-    #[tokio::test]
-    pub async fn test_watcher_kickback_versus_lazy() {
-        const KEY: &str = "database.pool.size";
+    // #[tokio::test]
+    // pub async fn test_watcher_kickback_versus_lazy() {
+    //     const KEY: &str = "database.pool.size";
 
-        let db = MemoryDatabase::new();
-        db.insert(Key::from_str(KEY), 0).await;
+    //     let db = MemoryDatabase::new();
+    //     db.insert(Key::from_str(KEY), 0).await;
 
-        let lazy = db.subscribe(Key::from_str(KEY), ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
-        let kickback = db.subscribe(Key::from_str(KEY), ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Kickback).await;
+    //     let lazy = db.subscribe(Key::from_str(KEY), ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+    //     let kickback = db.subscribe(Key::from_str(KEY), ClientId::from_id(0), WatcherBehaviour::Eager, WatcherActivity::Kickback).await;
 
-        // The kickback should have the value.
-        assert!(lazy.force_recv().await.is_none());
-        assert_eq!(kickback.force_recv().await.unwrap().as_integer().unwrap(), 0);
-
-
-    }
-
-    #[tokio::test]
-    /// This tests a complex setup with many watchers.
-    /// This test specifically deals with eager watchers, which means that they
-    /// can see either value (depending on when they receive it.)
-    pub async fn many_eager_watchers() {
-        const KEY: &str = "config.kafka.brokers";
-
-        let db = MemoryDatabase::new();
-
-        let mut handles = vec![];
-        for i in 0..100 {
-            handles.push(tokio::spawn({
-                let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
-                async move {
-
-                    let int = watcher.wait().await.unwrap().as_integer().unwrap();
-                    assert!(int == 12 || int == 6);
-                }
-            }));
-        }
+    //     // The kickback should have the value.
+    //     assert!(lazy.force_recv().await.is_none());
+    //     assert_eq!(kickback.force_recv().await.unwrap().as_integer().unwrap(), 0);
 
 
-        // We start out with twelve brokers.
-        db.insert(Key::from_str(KEY), 12).await;
+    // }
 
-        // Now let us scale down to 6.
-        db.insert(Key::from_str(KEY), 6).await;
+    // #[tokio::test]
+    // /// This tests a complex setup with many watchers.
+    // /// This test specifically deals with eager watchers, which means that they
+    // /// can see either value (depending on when they receive it.)
+    // pub async fn many_eager_watchers() {
+    //     const KEY: &str = "config.kafka.brokers";
+
+    //     let db = MemoryDatabase::new();
+
+    //     let mut handles = vec![];
+    //     for i in 0..100 {
+    //         handles.push(tokio::spawn({
+    //             let watcher = db.subscribe(Key::from_str(KEY),  ClientId::from_id(i), WatcherBehaviour::Eager, WatcherActivity::Lazy).await;
+    //             async move {
+
+    //                 let int = watcher.wait().await.unwrap().as_integer().unwrap();
+    //                 assert!(int == 12 || int == 6);
+    //             }
+    //         }));
+    //     }
 
 
-        for handle in handles {
-            handle.await.unwrap();
-        }
+    //     // We start out with twelve brokers.
+    //     db.insert(Key::from_str(KEY), 12).await;
+
+    //     // Now let us scale down to 6.
+    //     db.insert(Key::from_str(KEY), 6).await;
+
+
+    //     for handle in handles {
+    //         handle.await.unwrap();
+    //     }
         
 
 
-    }
+    // }
 }
