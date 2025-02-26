@@ -7,12 +7,14 @@ use overseer::{access::WatcherBehaviour, models::Value};
 pub struct WatchServer;
 pub struct WatchClient;
 
+type IValue = Option<Rc<Value>>;
+
 enum HoldingInner {
     /// An ordered watcher returns things in the order of
     /// which they came.
-    Ordered(RefCell<VecDeque<Option<Arc<Value>>>>),
+    Ordered(RefCell<VecDeque<IValue>>),
     /// An eager watcher does not care for this.
-    Eager(RefCell<Option<Arc<Value>>>)
+    Eager(RefCell<IValue>)
 
 }
 
@@ -71,7 +73,7 @@ pub struct Watcher<S> {
 
 impl Watcher<WatchServer> {
     /// This method notifies all of the watchers.
-    pub fn notify_coordinated<I, D>(witer: I, value: Option<Arc<Value>>)
+    pub fn notify_coordinated<I, D>(witer: I, value: IValue)
     where 
         I: Iterator<Item = D>,
         D: Deref<Target = Watcher<WatchServer>>
@@ -124,7 +126,7 @@ impl Watcher<()> {
 
 
 impl Watcher<WatchClient> {
-    pub async fn force_recv(&self) -> Option<Arc<Value>> {
+    pub async fn force_recv(&self) -> IValue {
 
         match &self.inner.inner {
             HoldingInner::Eager(value) => {
@@ -133,9 +135,9 @@ impl Watcher<WatchClient> {
             HoldingInner::Ordered(value) => {
                 value.borrow_mut().pop_front()?
             }
-        } 
+        }
     }
-    pub async fn wait(&self) -> Option<Arc<Value>> {
+    pub async fn wait(&self) -> IValue {
         match &self.inner.inner {
             HoldingInner::Eager(value) => {
                 if value.borrow_mut().is_some() {
@@ -164,7 +166,7 @@ impl Watcher<WatchClient> {
 
 
 impl Watcher<WatchServer> {
-    fn wake_without_notify(&self, nvalue: Option<Arc<Value>>) {
+    fn wake_without_notify(&self, nvalue: Option<Rc<Value>>) {
         match &self.inner.inner {
             HoldingInner::Eager(value) => {
                 *value.borrow_mut() = nvalue;
@@ -176,7 +178,7 @@ impl Watcher<WatchServer> {
             }
         }
     }
-    pub fn wake(&self, nvalue: Option<Arc<Value>>) {
+    pub fn wake(&self, nvalue: Option<Rc<Value>>) {
         self.wake_without_notify(nvalue);
         self.inner.wake();
     }
@@ -189,7 +191,7 @@ impl Watcher<WatchServer> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{rc::Rc, sync::Arc, time::Duration};
 
     use overseer::models::Value;
 
@@ -209,11 +211,11 @@ mod tests {
         // Configure an eager watcher. We will do a basic two-shot receive.
         let (client, server) = Watcher::new(WatcherBehaviour::Ordered);
         monoio::spawn(async move {
-            server.wake(Some(Arc::new(Value::Integer(2))));
-            server.wake(Some(Arc::new(Value::Integer(4))));
+            server.wake(Some(Rc::new(Value::Integer(2))));
+            server.wake(Some(Rc::new(Value::Integer(4))));
         });
-        assert_eq!(&*client.wait().await.unwrap(), &Value::Integer(2));
-        assert_eq!(&*client.wait().await.unwrap(), &Value::Integer(4));
+        assert_eq!(*client.wait().await.unwrap(), Value::Integer(2));
+        assert_eq!(*client.wait().await.unwrap(), Value::Integer(4));
     }
 
     #[monoio::test(enable_timer = true)]
@@ -222,13 +224,13 @@ mod tests {
         let (client_a, server_a) = Watcher::new(WatcherBehaviour::Ordered);
         let (client_b, server_b) = Watcher::new(WatcherBehaviour::Ordered);
         monoio::spawn(async move {
-            server_a.wake(Some(Arc::new(Value::Integer(2))));
-            assert_eq!(&*client_b.wait().await.unwrap(), &Value::Integer(3));
-            server_a.wake(Some(Arc::new(Value::Integer(5))));
+            server_a.wake(Some(Rc::new(Value::Integer(2))));
+            assert_eq!(*client_b.wait().await.unwrap(), Value::Integer(3));
+            server_a.wake(Some(Rc::new(Value::Integer(5))));
         });
-        assert_eq!(&*client_a.wait().await.unwrap(), &Value::Integer(2));
-        server_b.wake(Some(Arc::new(Value::Integer(3))));
-        assert_eq!(&*client_a.wait().await.unwrap(), &Value::Integer(5));
+        assert_eq!(*client_a.wait().await.unwrap(), Value::Integer(2));
+        server_b.wake(Some(Rc::new(Value::Integer(3))));
+        assert_eq!(*client_a.wait().await.unwrap(), Value::Integer(5));
     }
 
     #[monoio::test]
@@ -245,7 +247,7 @@ mod tests {
         let (client_2, server_2) = Watcher::new(WatcherBehaviour::Eager);
         
 
-        Watcher::notify_coordinated([server_1, server_2].iter(), Some(Arc::new(Value::Integer(45))));
+        Watcher::notify_coordinated([server_1, server_2].iter(), Some(Rc::new(Value::Integer(45))));
 
         assert_eq!(client_1.wait().await.unwrap().as_integer().unwrap(), 45);
         assert_eq!(client_2.wait().await.unwrap().as_integer().unwrap(), 45);
@@ -256,10 +258,10 @@ mod tests {
     #[monoio::test]
     pub async fn check_watcher_notify_integrity() {
         let (client_1, server_1) = Watcher::new(WatcherBehaviour::Eager);
-        server_1.wake_without_notify(Some(Arc::new(Value::Integer(2))));
+        server_1.wake_without_notify(Some(Rc::new(Value::Integer(2))));
         assert_eq!(client_1.wait().await.unwrap().as_integer().unwrap(), 2);
 
-        server_1.wake(Some(Arc::new(Value::Integer(4))));
+        server_1.wake(Some(Rc::new(Value::Integer(4))));
         assert_eq!(client_1.wait().await.unwrap().as_integer().unwrap(), 4);
 
     }

@@ -1,4 +1,4 @@
-use std::{net::ToSocketAddrs, path::Path, sync::Arc};
+use std::{net::ToSocketAddrs, path::Path, rc::Rc, sync::Arc};
 
 use dashmap::DashMap;
 use overseer::{error::NetworkError, models::Key, network::{Packet, PacketId, PacketPayload}};
@@ -8,7 +8,7 @@ use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream},
 use crate::database::{Database, WatchClient, Watcher};
 
 pub struct Driver {
-    internal: Arc<DriverInternal>
+    internal: Rc<DriverInternal>
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,11 +23,11 @@ impl ClientId {
 struct DriverInternal {
     database: Database,
     stream: TcpListener,
-    write_queue: DashMap<ClientId, Sender<Packet>>
+    write_queue: DashMap<ClientId, Sender<Packet<'static>>>
 }
 
 impl DriverInternal {
-    pub async fn send(&self, id: ClientId, packet: Packet) {
+    pub async fn send(&self, id: ClientId, packet: Packet<'static>) {
         let queue = self.write_queue.get(&id).unwrap().value().clone();
         queue.send(packet).await.unwrap();
     }
@@ -40,16 +40,16 @@ impl Driver {
         P: AsRef<Path>,
         S: AsRef<str>
     {
-        let internal = Arc::new(DriverInternal {
+        let internal = Rc::new(DriverInternal {
             database: Database::new(path, name).await?,
             stream: TcpListener::bind(addr).await?,
             write_queue: DashMap::new(),
         });
 
-        monoio::spawn(accept_connection_loop(Arc::clone(&internal)));
+        monoio::spawn(accept_connection_loop(Rc::clone(&internal)));
 
         Ok(Self {
-            internal: Arc::clone(&internal),
+            internal: Rc::clone(&internal),
         })
     }
     pub fn port(&self) -> u16 {
@@ -57,11 +57,11 @@ impl Driver {
     }
 }
 
-async fn accept_connection_loop(internal: Arc<DriverInternal>) -> Result<(), NetworkError> {
+async fn accept_connection_loop(internal: Rc<DriverInternal>) -> Result<(), NetworkError> {
     let mut counter = 0;
     loop {
         let (sock, _) = internal.stream.accept().await?;
-        handle_client(sock, ClientId(counter), Arc::clone(&internal)).await;
+        handle_client(sock, ClientId(counter), Rc::clone(&internal)).await;
         counter += 1;
     }
 }
@@ -69,13 +69,13 @@ async fn accept_connection_loop(internal: Arc<DriverInternal>) -> Result<(), Net
 async fn handle_client(
     socket: TcpStream,
     id: ClientId,
-    internal: Arc<DriverInternal>,
+    internal: Rc<DriverInternal>,
 ) {
     println!("Spawning new client...");
     let (read, write) = socket.into_split();
     let (sender, receiver) = tokio::sync::mpsc::channel(250);
     internal.write_queue.insert(id, sender);
-    let ctx = Arc::new(ClientContext {
+    let ctx = Rc::new(ClientContext {
         id,
         watches: DashMap::new(),
     });
@@ -85,12 +85,12 @@ async fn handle_client(
 
 struct ClientContext {
     id: ClientId,
-    watches: DashMap<Key, Arc<Watcher<WatchClient>>>,
+    watches: DashMap<Key, Rc<Watcher<WatchClient>>>,
 }
 
 async fn handle_client_write(
     mut socket: OwnedWriteHalf,
-    mut receiver: Receiver<Packet>,
+    mut receiver: Receiver<Packet<'static>>,
 ) -> Result<(), NetworkError> {
     loop {
         let packet = receiver.recv().await.unwrap();
@@ -100,48 +100,50 @@ async fn handle_client_write(
 
 async fn handle_client_read(
     mut socket: OwnedReadHalf,
-    internal: Arc<DriverInternal>,
-    ctx: Arc<ClientContext>,
+    internal: Rc<DriverInternal>,
+    ctx: Rc<ClientContext>,
 ) -> Result<(), NetworkError> {
     loop {
         let packet = Packet::read(&mut socket).await?;
-        match packet.payload() {
+        let packet_id = packet.id();
+        match packet.into_payload() {
             PacketPayload::Insert { key, value } => {
-                internal.database.insert(key.clone(), value.clone()).await?;
-                internal.send(ctx.id, Packet::vreturn(packet.id(), key, Some(value.to_owned()))).await;
+                internal.database.insert(key.clone(), (*value).clone()).await?;
+                internal.send(ctx.id, Packet::vreturn(packet_id, &*key, Some(&*value)).to_owned()).await;
             }
             PacketPayload::Get { key } => {
-                let value = { internal.database.get(key).await }.map(|f| (*f).to_owned());
+                // let key = &**key;
+                let value = internal.database.get(&*key).await;
                 internal
-                    .send(ctx.id, Packet::vreturn(packet.id(), key, value))
+                    .send(ctx.id, Packet::vreturn(packet_id, &*key, value.as_deref()).to_owned())
                     .await;
             }
             PacketPayload::Delete { key } => {
-                internal.database.delete(key).await?;
-                internal.send(ctx.id, Packet::get(packet.id(), key.to_owned())).await;
+                internal.database.delete(&*key).await?;
+                internal.send(ctx.id, Packet::get(packet_id, &*key).to_owned()).await;
             }
             PacketPayload::Watch {
                 key,
                 activity,
                 behaviour,
             } => {
-                let wow = Arc::new(
+                let wow = Rc::new(
                     internal
                         .database
-                        .subscribe(key.clone(), ctx.id, *behaviour, *activity)
+                        .subscribe(key.clone(), ctx.id, behaviour, activity)
                         .await?,
                 );
-                ctx.watches.insert(key.clone(), Arc::clone(&wow));
+                ctx.watches.insert((*key).clone(), Rc::clone(&wow));
                 
                 monoio::spawn({
-                    let internal = Arc::clone(&internal);
-                    let ctx = Arc::clone(&ctx);
+                    let internal = Rc::clone(&internal);
+                    let ctx = Rc::clone(&ctx);
                     let key = key.clone();
                     async move {
-                        spawn_subscriber(key, wow, internal, ctx).await;
+                        spawn_subscriber(&*key, wow, internal, ctx).await;
                     }
                 });
-                internal.send(ctx.id, Packet::get(packet.id(), key.to_owned())).await;
+                internal.send(ctx.id, Packet::get(packet_id, &*key).to_owned()).await;
             }
             PacketPayload::Release { key } => {
                 if let Some(..) = ctx.watches.remove(&key) {
@@ -149,7 +151,7 @@ async fn handle_client_read(
                 } else {
                     // Key not present.
                 }
-                internal.send(ctx.id, Packet::get(packet.id(), key)).await;
+                internal.send(ctx.id, Packet::get(packet_id, &*key).to_owned()).await;
             }
             _ => unimplemented!(),
         }
@@ -158,26 +160,26 @@ async fn handle_client_read(
 
 /// Handles watchng for a certain key.
 async fn spawn_subscriber(
-    key: Key,
-    watcher: Arc<Watcher<WatchClient>>,
-    internal: Arc<DriverInternal>,
-    ctx: Arc<ClientContext>,
+    key: &Key,
+    watcher: Rc<Watcher<WatchClient>>,
+    internal: Rc<DriverInternal>,
+    ctx: Rc<ClientContext>,
 ) {
     loop {
-        let val = watcher.wait().await.map(|f| (*f).to_owned());
+        let val = watcher.wait().await;
         if watcher.is_killed() {
             // Break this and die.
             break;
         }
         internal
-            .send(ctx.id, Packet::notify(PacketId::zero(), key.clone(), val, false))
+            .send(ctx.id, Packet::notify(PacketId::zero(), key, val.as_deref(), false).to_owned())
             .await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{net::Ipv4Addr, sync::Arc};
+    use std::{net::Ipv4Addr, rc::Rc, sync::Arc};
 
     use overseer::{
         access::{WatcherActivity, WatcherBehaviour},
@@ -187,6 +189,7 @@ mod tests {
     use monoio::{
         net::TcpStream,
     };
+    use tokio::sync::Barrier;
 
     use crate::net::Driver;
 
@@ -195,13 +198,13 @@ mod tests {
     //     let td = tempfile::tempdir().unwrap();
     //     let server = Driver::start("127.0.0.1:0", td.path(), "db").await.unwrap();
 
-    //     let staging = Arc::new(Barrier::new(2));
-    //     let staging2 = Arc::new(Barrier::new(2));
+    //     let staging = Rc::new(Barrier::new(2));
+    //     let staging2 = Rc::new(Barrier::new(2));
 
     //     let handle = monoio::spawn({
     //         let port = server.port();
-    //         let staging = Arc::clone(&staging);
-    //         let staging2 = Arc::clone(&staging2);
+    //         let staging = Rc::clone(&staging);
+    //         let staging2 = Rc::clone(&staging2);
     //         async move {
     //             let mut connect = TcpStream::connect((Ipv4Addr::new(127, 0, 0, 1), port)).await?;
 

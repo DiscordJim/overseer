@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, sync::Arc};
+use std::{borrow::Borrow, cell::RefCell, collections::HashMap, iter::Map, marker::PhantomData, rc::Rc, sync::Arc};
 
 use dashmap::DashMap;
 use monoio::io::{as_fd::AsWriteFd, AsyncWriteRent, AsyncWriteRentExt};
@@ -12,19 +12,20 @@ use super::watcher::{WatchClient, WatchServer, Watcher};
 
 pub struct MemoryDatabase {
     /// The database list of records.
-    records: DashMap<Key, Record>,
+    records: RefCell<HashMap<Key, Record>>,
     /// The list of watchers.
     watchers: DashMap<Key, DashMap<ClientId, Watcher<WatchServer>>>
 }
 
 pub struct Record {
-    value: Arc<Value>
+    value: Rc<Value>
 }
+
 
 impl Record {
     pub fn new(value: Value) -> Self {
         Self {
-            value: Arc::new(value)
+            value: Rc::new(value)
         }
     }
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
@@ -38,10 +39,10 @@ impl Record {
         R: tokio::io::AsyncRead + Unpin
     {
         Ok(Self {
-            value: Arc::new(Value::read(reader).await?)
+            value: Rc::new(Value::read(reader).await?)
         })
     }
-    pub fn value(&self) -> &Arc<Value> {
+    pub fn value(&self) -> &Rc<Value> {
         &self.value
     }
 }
@@ -49,7 +50,7 @@ impl Record {
 impl MemoryDatabase {
     pub fn new() -> Self {
         Self {
-            records: DashMap::new(),
+            records: RefCell::new(HashMap::new()),
             watchers: DashMap::new(),
         }
     }
@@ -61,15 +62,15 @@ impl MemoryDatabase {
     {
         // let wow = *self.records.get(&key).unwrap();
         let key = key.borrow();
-        let value = Arc::new(value.into());
-        self.records.insert(key.clone(), Record {
-            value: Arc::clone(&value)
+        let value = Rc::new(value.into());
+        self.records.borrow_mut().insert(key.clone(), Record {
+            value: Rc::clone(&value)
         });
         self.notify(key, Some(value)).await;
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.records.borrow().len()
     }
     pub async fn subscribe<K>(&self, key: K, client_id: ClientId, behaviour: WatcherBehaviour, activity: WatcherActivity) -> Watcher<WatchClient>
         where 
@@ -117,7 +118,7 @@ impl MemoryDatabase {
             false
         }
     }
-    pub async fn notify<K>(&self, key: K, value: Option<Arc<Value>>) -> bool
+    pub async fn notify<K>(&self, key: K, value: Option<Rc<Value>>) -> bool
     where 
         K: Borrow<Key>
     {
@@ -133,7 +134,7 @@ impl MemoryDatabase {
         if self.len() == 0 {
             return false;
         } else {
-            if self.records.remove(key).is_some() {
+            if self.records.borrow_mut().remove(key).is_some() {
                 self.notify(key, None).await;
                 true
             } else {
@@ -141,10 +142,11 @@ impl MemoryDatabase {
             }
         }
     }
-    pub async fn get(&self, key: &Key) -> Option<Arc<Value>> {
-        Some(self.records.get(key)?.value().value.clone())
+    pub async fn get(&self, key: &Key) -> Option<Rc<Value>> {
+        Some(Rc::clone(self.records.borrow().get(key)?.value()))
     }
 }
+
 
 
 

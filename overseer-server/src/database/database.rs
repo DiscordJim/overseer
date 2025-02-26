@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, path::Path, sync::Arc};
+use std::{borrow::Borrow, path::Path, rc::Rc, sync::Arc};
 
 use overseer::{
     access::{WatcherActivity, WatcherBehaviour},
@@ -40,7 +40,7 @@ impl Database {
         Ok(Self { memory, storage })
     }
     /// Gets a value for a key.
-    pub async fn get<K>(&self, key: K) -> Option<Arc<Value>>
+    pub async fn get<K>(&self, key: K) -> Option<Rc<Value>>
     where
         K: Borrow<Key>,
     {
