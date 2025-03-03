@@ -1,17 +1,17 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}};
+use crate::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, LocalReadAsync, Value}};
 
 use super::decoder::{read_packet, write_packet};
 
 pub const CURRENT_VERSION: u8 = 0;
 
 #[derive(Debug)]
-pub struct Packet {
+pub struct Packet<'a> {
     id: PacketId,
-    payload: PacketPayload 
+    payload: PacketPayload<'a>
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -32,8 +32,10 @@ impl PacketId {
     }
 }
 
-impl Packet {
-    pub fn new(id: PacketId, payload: PacketPayload) -> Self {
+
+
+impl<'a> Packet<'a> {
+    pub fn new(id: PacketId, payload: PacketPayload<'a>) -> Self {
         Self {
             id,
             payload
@@ -42,97 +44,92 @@ impl Packet {
     pub fn id(&self) -> PacketId {
         self.id
     }
-    pub fn payload(&self) -> &PacketPayload {
+    pub fn payload(&self) -> &PacketPayload<'a> {
         &self.payload
     }
     
+    pub fn into_payload(self) -> PacketPayload<'a> {
+        self.payload
+    }
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
     where 
         W: AsyncWrite + Unpin
     {
         write_packet(self, writer).await
     }
-    pub async fn read<R>(reader: &mut R) -> Result<Packet, NetworkError>
+    pub async fn read<R>(reader: &mut R) -> Result<Packet<'static>, NetworkError>
     where
-        R: AsyncRead + Unpin
+        R: LocalReadAsync
     {
         read_packet(reader).await
     }
-    pub fn get<K>(id: PacketId, key: K) -> Self
-    where 
-        K: Borrow<Key>
+    pub fn get(id: PacketId, key: &'a Key) -> Self
     {
         Self {
             id,
-            payload: PacketPayload::Get { key: key.borrow().to_owned() }
+            payload: PacketPayload::get(key)
         }
     }
-    pub fn delete<K>(id: PacketId, key: K) -> Self
-    where 
-        K: Borrow<Key>
+    pub fn delete(id: PacketId, key: &'a Key) -> Self
     {
         Self {
             id,
-            payload: PacketPayload::Delete { key: key.borrow().to_owned() }
+            payload: PacketPayload::delete(key)
         }
     }
-    pub fn insert<K>(id: PacketId, key: K, value: Value) -> Self
-    where 
-        K: Borrow<Key>
+    pub fn insert(id: PacketId, key: &'a Key, value: &'a Value) -> Self
     {
         Self {
             id,
-            payload: PacketPayload::Insert { key: key.borrow().to_owned(), value }
+            payload: PacketPayload::insert(key, value)
         }
     }
-    pub fn release<K>(id: PacketId, key: K) -> Self
-    where 
-        K: Borrow<Key>
+    pub fn release(id: PacketId, key: &'a Key) -> Self
     {
         Self {
             id,
-            payload: PacketPayload::Release { key: key.borrow().to_owned() }
+            payload: PacketPayload::release(key)
         }
     }
-    pub fn watch<K>(
+    pub fn watch(
         id: PacketId,
-        key: K,
+        key: &'a Key,
         activity: WatcherActivity,
         behaviour: WatcherBehaviour
     ) -> Self
-    where 
-        K: Borrow<Key>
     {
         Self {
             id,
-            payload: PacketPayload::Watch { key: key.borrow().to_owned(), activity, behaviour }
+            payload: PacketPayload::watch(key, activity, behaviour)
         }
     }
-    pub fn vreturn<K>(
+    pub fn vreturn(
         id: PacketId,
-        key: K,
-        value: Option<Value>
+        key: &'a Key,
+        value: Option<&'a Value>
     ) -> Self
-    where 
-        K: Borrow<Key>
     {
         Self {
             id,
-            payload: PacketPayload::Return { key: key.borrow().to_owned(), value }
+            payload: PacketPayload::return_packet(key, value)
         }
     }
-    pub fn notify<K>(
+    pub fn notify(
         id: PacketId,
-        key: K,
-        value: Option<Value>,
+        key: &'a Key,
+        value: Option<&'a Value>,
         is_more: bool
     ) -> Self
-    where 
-        K: Borrow<Key>
     {
         Self {
             id,
-            payload: PacketPayload::Notify { key: key.borrow().to_owned(), value, more: is_more }
+            payload: PacketPayload::notify(key, value, is_more)
+        }
+    }
+    pub fn to_owned(self) -> Packet<'static> {
+        Packet {
+            id: self.id,
+            payload: self.payload.to_owned()
         }
     }
 }
@@ -145,56 +142,59 @@ impl Packet {
 // }
 
 #[derive(Debug)]
-pub enum PacketPayload {
+pub enum PacketPayload<'a> {
     Insert {
-        key: Key,
-        value: Value
+        key: Cow<'a, Key>,
+        value: Cow<'a, Value>
     },
     Get {
-        key: Key
+        key: Cow<'a, Key>
     },
     Watch {
-        key: Key,
+        key: Cow<'a, Key>,
         activity: WatcherActivity,
         behaviour: WatcherBehaviour
     },
     Release {
-        key: Key
+        key: Cow<'a, Key>
     },
     Delete {
-        key: Key
+        key: Cow<'a, Key>
     },
     Notify {
-        key: Key,
-        value: Option<Value>,
+        key: Cow<'a, Key>,
+        value: Option<Cow<'a, Value>>,
         more: bool
     },
     Return {
-        key: Key,
-        value: Option<Value>
+        key: Cow<'a, Key>,
+        value: Option<Cow<'a, Value>>
     }
 }
 
 
-impl PacketPayload {
-    pub fn notify<K: Into<Key>, V: Into<Value>>(key: K, value: Option<V>, more: bool) -> Self {
-        Self::Notify { key: key.into(), value: value.map(Into::into), more }
+impl<'a> PacketPayload<'a> {
+    pub fn notify(key: &'a Key, value: Option<&'a Value>, more: bool) -> Self {
+        Self::Notify { key: Cow::Borrowed(key), value: value.map(|f| Cow::Borrowed(f)), more }
 
     }
-    pub fn release<K: Into<Key>>(key: K) -> Self {
-        Self::Release { key: key.into() }
+    pub fn return_packet(key: &'a Key, value: Option<&'a Value>) -> Self {
+        Self::Return { key: Cow::Borrowed(key), value: value.map(|f| Cow::Borrowed(f)) }
     }
-    pub fn watch<K: Borrow<Key>>(key: K, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Self {
-        Self::Watch { key: key.borrow().to_owned(), activity, behaviour }
+    pub fn release(key: &'a Key) -> Self {
+        Self::Release { key: Cow::Borrowed(key) }
     }
-    pub fn insert<K: Borrow<Key>, V: Into<Value>>(key: K, value: V) -> Self {
-        Self::Insert { key: key.borrow().to_owned(), value: value.into() }
+    pub fn watch(key: &'a Key, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Self {
+        Self::Watch { key: Cow::Borrowed(key), activity, behaviour }
     }
-    pub fn delete<K: Borrow<Key>>(key: K) -> Self {
-        Self::Delete { key: key.borrow().to_owned() }
+    pub fn insert(key: &'a Key, value: &'a Value) -> Self {
+        Self::Insert { key: Cow::Borrowed(key), value: Cow::Borrowed(value) }
     }
-    pub fn get<K: Borrow<Key>>(key: K) -> Self {
-        Self::Get { key: key.borrow().to_owned() }
+    pub fn delete(key: &'a Key) -> Self {
+        Self::Delete { key: Cow::Borrowed(key) }
+    }
+    pub fn get(key: &'a Key) -> Self {
+        Self::Get { key: Cow::Borrowed(key) }
     }
     pub fn discriminator(&self) -> u8 {
         match self {
@@ -207,5 +207,45 @@ impl PacketPayload {
             Self::Return { .. } => 6
         }
     }
+    pub fn to_owned(self) -> PacketPayload<'static> {
+        // match self {
+        //     Self::Delete { key } => Self::Delete { key: Cow::Owned(key.into_owned()) },
+        //     Self::Get { key } => Self::Get { key: key.to_owned() },
+        //     Self::Insert { key, value } => Self::Insert { key: key.to_owned(), value: value.to_owned() },
+        //     Self::Notify { key, value, more } => Self::Notify { key: key.to_owned(), value: value.to_owned(), more },
+        //     Self::Release { key } => Self::Release { key: key.to_owned() },
+        //     Self::Watch { key, activity, behaviour } => Self::Watch { key: key.to_owned(), activity, behaviour },
+        //     Self::Return { key, value } => Self::Return { key: key.to_owned(), value: value.map(|f| f.to_owned()) },
+
+        // }
+        own_packet_payload(self)
+    }
     
+}
+
+
+// fn own_packet(packet: Packet<'_>) -> Packet<'static> {
+//     Packet {
+        
+//     }
+// }
+
+fn own_packet_payload(payload: PacketPayload<'_>) -> PacketPayload<'static> {
+    match payload {
+        PacketPayload::Delete { key } => PacketPayload::Delete { key: Cow::Owned(key.into_owned()) },
+        PacketPayload::Get { key } => PacketPayload::Get { key: Cow::Owned(key.into_owned()) },
+        PacketPayload::Insert { key, value } => PacketPayload::Insert { key: Cow::Owned(key.into_owned()), value: Cow::Owned(value.into_owned()) },
+        PacketPayload::Notify { key, value, more } => PacketPayload::Notify { key: Cow::Owned(key.into_owned()), value: own_value_cow(value), more },
+        PacketPayload::Release { key } => PacketPayload::Release { key: Cow::Owned(key.into_owned()) },
+        PacketPayload::Watch { key, activity, behaviour } => PacketPayload::Watch { key: Cow::Owned(key.into_owned()), activity, behaviour },
+        PacketPayload::Return { key, value } => PacketPayload::Return { key: Cow::Owned(key.into_owned()), value: own_value_cow(value) },
+
+    }
+}
+
+fn own_value_cow(value: Option<Cow<'_, Value>>) -> Option<Cow<'static, Value>> {
+    match value {
+        Some(v) => Some(Cow::Owned(v.into_owned())),
+        None => None
+    }
 }

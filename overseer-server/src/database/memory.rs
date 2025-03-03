@@ -2,7 +2,7 @@ use std::{borrow::Borrow, cell::RefCell, collections::HashMap, iter::Map, marker
 
 use dashmap::DashMap;
 use monoio::io::{as_fd::AsWriteFd, AsyncWriteRent, AsyncWriteRentExt};
-use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}};
+use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, LocalReadAsync, Value}};
 
 use crate::net::ClientId;
 
@@ -36,7 +36,7 @@ impl Record {
     }
     pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
     where 
-        R: tokio::io::AsyncRead + Unpin
+        R: LocalReadAsync
     {
         Ok(Self {
             value: Rc::new(Value::read(reader).await?)

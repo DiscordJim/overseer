@@ -1,8 +1,13 @@
+use std::borrow::Cow;
+
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{error::{NetworkError, ValueParseError}, network::decoder::{read_value, write_value}};
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+use super::LocalReadAsync;
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Value {
     String(String),
     Integer(i64)
@@ -14,11 +19,11 @@ impl Value {
     where 
         W: AsyncWrite + Unpin
     {
-        write_value(self, writer).await
+        write_value(&Cow::Borrowed(self), writer).await
     }
     pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
     where 
-        R: AsyncRead + Unpin
+        R: LocalReadAsync
     {
         read_value(reader).await
     }

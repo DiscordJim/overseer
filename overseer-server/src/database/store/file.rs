@@ -4,12 +4,12 @@ use monoio::fs::{File, OpenOptions};
 use overseer::error::NetworkError;
 
 pub const MAGIC_BYTE: u8 = 0x83;
-pub const PAGE_SIZE: u32 = 16384;
+pub const PAGE_SIZE: usize = 4096;
 pub const RESERVED_HEADER_SIZE: u32 = 512;
 
 
-pub const PAGE_HEADER_RESERVED_BYTES: u32 = 1 + 4; // Is free + Previous
-pub const PAGE_FOOTER_RESERVED_BYTES: u32 = 4;
+pub const PAGE_HEADER_RESERVED_BYTES: u32 = 1 + 4 + 4 + 1; // Is free + Previous
+// pub const PAGE_FOOTER_RESERVED_BYTES: u32 = 4;
 
 pub struct PagedFile {
     underlying: File,
@@ -46,7 +46,7 @@ impl PagedFile {
         } else {
             // Initialize the free-list
             for i in 0..object.pages() {
-                let addr = RawPageAddress::new(RESERVED_HEADER_SIZE + (i * PAGE_SIZE));
+                let addr = RawPageAddress::new(RESERVED_HEADER_SIZE + (i * PAGE_SIZE as u32));
                 let (r, b) = object.underlying.read_exact_at(vec![0u8], addr.as_u64()).await;
                 r?;
                 if b[0] == 1 {
@@ -72,7 +72,7 @@ impl PagedFile {
         if !self.is_initialized {
             0
         } else {
-            ((self.file_size as u32) - RESERVED_HEADER_SIZE) / PAGE_SIZE
+            ((self.file_size as u32) - RESERVED_HEADER_SIZE) / PAGE_SIZE as u32
         }
     }
     pub fn free_pages(&self) -> usize {
@@ -82,21 +82,21 @@ impl PagedFile {
         if page >= self.pages() {
             Err(NetworkError::PageOutOfBounds)?;
         }
-        let acked = load_page(self, RawPageAddress::new((RESERVED_HEADER_SIZE) + ((page) * PAGE_SIZE)), PAGE_SIZE).await?;
+        let acked = load_page(self, RawPageAddress::new((RESERVED_HEADER_SIZE) + ((page) * PAGE_SIZE as u32)), PAGE_SIZE as u32).await?;
         if acked.free {
             return Err(NetworkError::PageFreedError);
         }
         Ok(acked)
     }
-    async fn new_page(&mut self) -> Result<Page, NetworkError>
+    pub async fn new_page(&mut self) -> Result<Page, NetworkError>
     {
         if self.free_list.is_empty() {
             // If the free list is empty we have to make a new page from scratch.
-            self.reserve(RawPageAddress::new((RESERVED_HEADER_SIZE + (self.pages() * PAGE_SIZE)) as u32), PAGE_SIZE, RawPageAddress::zero()).await
+            self.reserve(RawPageAddress::new((RESERVED_HEADER_SIZE + (self.pages() * (PAGE_SIZE as u32))) as u32), PAGE_SIZE as u32, RawPageAddress::zero()).await
         } else {
             // Let us reuse a page.
             let to_use = self.free_list.pop().unwrap();
-            self.reserve(to_use, PAGE_SIZE, RawPageAddress::zero()).await
+            self.reserve(to_use, PAGE_SIZE as u32, RawPageAddress::zero()).await
         }
         
     }
@@ -104,7 +104,7 @@ impl PagedFile {
         if self.pages() == 0 {
             self.file_size += size as u64;
             println!()
-        } else if self.pages() > 0 && (ptr.as_u64() as u32 - RESERVED_HEADER_SIZE) / PAGE_SIZE >= self.pages() {
+        } else if self.pages() > 0 && (ptr.as_u64() as u32 - RESERVED_HEADER_SIZE) / PAGE_SIZE as u32 >= self.pages() {
             self.file_size += size as u64;
         }
         let mut page = Page {
@@ -126,12 +126,6 @@ impl PagedFile {
 }
 
 
-pub struct PageFileHeader {
-    magic: u32,
-    major: u32,
-    minor: u32,
-    patch: u32
-}
 
 #[derive(Debug)]
 pub struct Page {
@@ -143,7 +137,7 @@ pub struct Page {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-struct RawPageAddress(u32);
+pub struct RawPageAddress(u32);
 
 impl RawPageAddress {
     pub fn new(inner: u32) -> Self {
@@ -169,20 +163,37 @@ impl RawPageAddress {
         if self.is_zero() {
             0
         } else {
-            (self.0 - RESERVED_HEADER_SIZE) / PAGE_SIZE
+            (self.0 - RESERVED_HEADER_SIZE) / PAGE_SIZE as u32
         }
         
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum PageType {
-    Normal
+    Normal,
+    Dummy
+}
+
+impl PageType {
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            Self::Normal => 0,
+            Self::Dummy => 1
+        }
+    }
+    pub fn from_u8(discrim: u8) -> Result<Self, NetworkError> {
+        Ok(match discrim {
+            0 => Self::Normal,
+            1 => Self::Dummy,
+            _ => Err(NetworkError::ErrorDecodingBoolean)?
+        })
+    }
 }
 
 async fn format_pagefile_header(file: &PagedFile, page: &Page) -> Result<(), NetworkError>
 {
-    page.write(file, 0, vec![MAGIC_BYTE, 0, 0, 0]).await.unwrap();
+    page.raw_write(file, 0, vec![MAGIC_BYTE, 0, 0, 0]).await.unwrap();
 
 
     Ok(())
@@ -195,7 +206,7 @@ async fn load_page(file: &PagedFile, ptr: RawPageAddress, size: u32) -> Result<P
     let is_free = e[0] == 1;
     let previous_page = RawPageAddress::new(u32::from_le_bytes(e[1..5].try_into().unwrap()) * (PAGE_SIZE as u32) + (RESERVED_HEADER_SIZE as u32));
     
-    let (r, e) = file.underlying.read_exact_at(vec![0u8; 4], ptr.offset(size - 4).as_u64()).await;
+    let (r, e) = file.underlying.read_exact_at(vec![0u8; 4], ptr.offset(5).as_u64()).await;
     r?;
     let next_page = RawPageAddress::new(u32::from_le_bytes(e[0..4].try_into().unwrap()) * (PAGE_SIZE as u32) + (RESERVED_HEADER_SIZE as u32));
     
@@ -218,7 +229,7 @@ async fn format_page(file: &PagedFile, page: &mut Page) -> Result<(), NetworkErr
     page.raw_write(file, 0, vec![0u8; page.size as usize]).await?;
 
     // Write the free byte. (we are obviously free)
-    page.write(file, 0, vec![0u8]).await?;
+    // page.write(file, 0, vec![0u8, 0u8, 0u8, 0u8, 0u8, 0u8]).await?;
 
     page.next = RawPageAddress::zero();
     page.previous = RawPageAddress::zero();
@@ -240,7 +251,7 @@ impl Page {
         Ok(buf)
     }
     pub async fn read(&self, file: &PagedFile, position: u32, size: u32) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, size + PAGE_FOOTER_RESERVED_BYTES)?;
+        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, size)?;
         let (r, buf) = file.underlying.read_exact_at(Vec::with_capacity(size as usize), self.start.offset(position).offset(PAGE_HEADER_RESERVED_BYTES as u32).as_u64()).await;
         r?;
         Ok(buf)
@@ -251,8 +262,9 @@ impl Page {
         r?;
         Ok(buf)
     }
+    
     pub async fn write(&self, file: &PagedFile, position: u32, bytes: Vec<u8>) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, bytes.len() as u32 + PAGE_FOOTER_RESERVED_BYTES)?;
+        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, bytes.len() as u32)?;
         let (r, buf) = file.underlying.write_all_at(bytes, self.start.offset(position as u32).offset(PAGE_HEADER_RESERVED_BYTES as u32).as_u64()).await;
         r?;
         Ok(buf)
@@ -263,19 +275,30 @@ impl Page {
         file.free_list.push(self.start);
         Ok(())
     }
+    pub async fn get_type(&self, file: &mut PagedFile) -> Result<PageType, NetworkError> {
+        let ntype = self.raw_read(file, 9, 1).await?[0];
+        PageType::from_u8(ntype)
+    }
+    pub async fn set_type(&self, ptype: PageType, file: &mut PagedFile) -> Result<(), NetworkError> {
+        self.raw_write(file, 9, vec![ptype.as_u8()]).await?;
+        Ok(())
+    }
     async fn set_previous(&mut self, file: &PagedFile, previous: u32) -> Result<(), NetworkError> {
         self.raw_write(file, 1, previous.to_le_bytes().to_vec()).await?;
-        self.previous = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE);
+        self.previous = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE as u32);
         Ok(())
     }
     async fn set_next(&mut self, file: &PagedFile, previous: u32) -> Result<(), NetworkError> {
-        self.raw_write(file, self.size - 4 as u32, previous.to_le_bytes().to_vec()).await?;
-        self.next = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE);
+        self.raw_write(file, 5, previous.to_le_bytes().to_vec()).await?;
+        self.next = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE as u32);
         Ok(())
     }
     /// Checks if this page has a next.
     pub fn has_next(&self) -> bool {
         !self.next.is_zero()
+    }
+    pub fn size(&self) -> u32 {
+        self.size
     }
     /// This will allocate a new page if we do not have a next page.
     pub async fn get_next(&mut self, file: &mut PagedFile) -> Result<Page, NetworkError> {
@@ -290,8 +313,14 @@ impl Page {
             Ok(o)
         }
     }
-    pub async fn capacity(&self) -> u32 {
-        self.size - PAGE_HEADER_RESERVED_BYTES - PAGE_FOOTER_RESERVED_BYTES
+    pub fn capacity(&self) -> u32 {
+        self.size - PAGE_HEADER_RESERVED_BYTES 
+    }
+    pub async fn view(&self, file: &PagedFile) -> Result<[u8; PAGE_SIZE], NetworkError> {
+        Ok(self.raw_read(file, 0, PAGE_SIZE as u32).await?.try_into().unwrap())
+    }
+    pub fn end(&self) -> RawPageAddress {
+        self.start.offset(self.size)
     }
 
     
@@ -303,9 +332,26 @@ mod tests {
     use overseer::error::NetworkError;
     use tempfile::tempdir;
 
-    use crate::database::store::file::{PAGE_SIZE, RESERVED_HEADER_SIZE};
+    use crate::database::store::file::{PageType, RawPageAddress, PAGE_SIZE, RESERVED_HEADER_SIZE};
 
     use super::PagedFile;
+
+    #[monoio::test]
+    pub async fn page_types() {
+        let dir = tempdir().unwrap();
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+        assert_eq!(paged.file_size as u32, RESERVED_HEADER_SIZE);
+        let page=  paged.new_page().await.unwrap();
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
+
+        page.set_type(PageType::Dummy, &mut paged).await.unwrap();
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
+
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
+        
+    
+    }
 
 
     #[monoio::test]
@@ -316,7 +362,7 @@ mod tests {
         paged.new_page().await.unwrap();
         paged.new_page().await.unwrap();
 
-        assert_eq!(paged.file_size as u32, RESERVED_HEADER_SIZE + PAGE_SIZE + PAGE_SIZE);
+        assert_eq!(paged.file_size as usize, RESERVED_HEADER_SIZE as usize + PAGE_SIZE + PAGE_SIZE);
 
         let mut page = paged.acquire(0).await.unwrap();
         page.write(&paged, 0, vec![1,2,3]).await.unwrap();
@@ -371,11 +417,38 @@ mod tests {
         assert_eq!(chain.previous.page_number(), 0);
         assert_eq!(page.next.page_number(), 1);
 
-        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+        let paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
         let page_a = paged.acquire(0).await.unwrap();
         let page_b = paged.acquire(1).await.unwrap();
         assert_eq!(page_a.next.page_number(), 1);
         assert_eq!(page_b.previous.page_number(), 0);
+        
+    }
+
+    #[monoio::test]
+    pub async fn test_header_consistency() {
+
+        // This makes sure we are reading/writing the header correctly.
+
+        let dir = tempdir().unwrap();
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+        let mut page = paged.new_page().await.unwrap();
+
+     
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
+        page.set_next(&paged, 23).await.unwrap();
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
+        assert_eq!(page.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
+
+        page.set_previous(&paged, 78).await.unwrap();
+        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
+        assert_eq!(page.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
+        assert_eq!(page.previous.as_u64(), RESERVED_HEADER_SIZE as u64 + 78 * PAGE_SIZE as u64);
+
+
+
+
+
         
     }
 }

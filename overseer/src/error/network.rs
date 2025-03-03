@@ -1,9 +1,19 @@
+use std::array::TryFromSliceError;
+
 use thiserror::Error;
 
 
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
+    // #[error("Try from slice fail")]
+    // FailedSliceConversion(#[from] TryFromSliceError),
+    #[error("Illegal read.")]
+    IllegalRead,
+    #[error("This page is freed and cannot be freely acquired.")]
+    PageFreedError,
+    #[error("PAge was out of bounds")]
+    PageOutOfBounds,
     #[error("Failed to connect to address.")]
     SocketBindFailure(tokio::io::Error),
     #[error("Unrecognized packet discriminator")]

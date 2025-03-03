@@ -1,9 +1,13 @@
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{error::NetworkError, network::decoder::{read_key, write_key}};
 
+use super::{LocalReadAsync, LocalWriteAsync};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Key(String);
 
 impl Key {
@@ -15,13 +19,13 @@ impl Key {
     }
     pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
     where 
-        R: AsyncRead + Unpin
+        R: LocalReadAsync
     {
         read_key(reader).await
     }
     pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
     where 
-        W: AsyncWrite + Unpin
+        W: LocalWriteAsync
     {
         write_key(self, writer).await
     }

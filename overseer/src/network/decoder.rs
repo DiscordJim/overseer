@@ -1,18 +1,21 @@
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::borrow::Cow;
+
+
 
 use crate::{
     access::{WatcherActivity, WatcherBehaviour},
     error::NetworkError,
-    models::{Key, Value},
+    models::{Key, LocalReadAsync, LocalWriteAsync, Value},
 };
 
 use super::{Packet, PacketId, PacketPayload, CURRENT_VERSION};
 
+
 // Encoder
 
-pub(crate) async fn write_packet<W>(packet: &Packet, socket: &mut W) -> Result<(), NetworkError>
+pub(crate) async fn write_packet<'a, W>(packet: &Packet<'a>, socket: &mut W) -> Result<(), NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    W: LocalWriteAsync,
 {
     socket.write_u8(CURRENT_VERSION).await?;
     socket.write_u32(packet.id().id()).await?;
@@ -29,21 +32,23 @@ where
             behaviour,
         } => write_watch_packet(key, activity, behaviour, socket).await,
         PacketPayload::Delete { key } => write_delete_packet(key, socket).await,
-        PacketPayload::Notify { key, value, more } => write_notify_packet(key, value, *more, socket).await,
-        PacketPayload::Return { key, value } => write_getreturn_packet(key, value, socket).await,
+        PacketPayload::Notify { key, value, more } => write_notify_packet(key, value.as_deref(), *more, socket).await,
+        PacketPayload::Return { key, value } => write_getreturn_packet(key, value.as_deref(), socket).await,
     }
 }
 
 /// Reads a packet by deferring to submethods.
-pub(crate) async fn read_packet<R>(socket: &mut R) -> Result<Packet, NetworkError>
+pub(crate) async fn read_packet<R>(socket: &mut R) -> Result<Packet<'static>, NetworkError>
 where
-    R: AsyncRead + Unpin,
+    R: LocalReadAsync
 {
 
     let version = socket.read_u8().await?;
 
     let id_first = socket.read_u32().await?;
     let id_second = socket.read_u32().await?;
+
+    // println!("{version} {id_first} {id_second}");
     // let id = socket.read_i64().await?;
 
     Ok(Packet::new(
@@ -55,9 +60,9 @@ where
     ))
 }
 
-async fn read_packet_v0<R>(socket: &mut R) -> Result<PacketPayload, NetworkError>
+async fn read_packet_v0<'a, R>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError>
 where
-    R: AsyncRead + Unpin,
+    R: LocalReadAsync,
 {
     let discrim = socket.read_u8().await?;
     match discrim {
@@ -72,27 +77,27 @@ where
     }
 }
 
-async fn write_getreturn_packet<W>(
+async fn write_getreturn_packet<'a, W>(
     key: &Key,
-    val: &Option<Value>,
+    val: Option<&'a Value>,
     socket: &mut W,
 ) -> Result<(), NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    W: LocalWriteAsync,
 {
     write_key(key, socket).await?;
     write_optional_value(val, socket).await?;
     Ok(())
 }
 
-async fn write_notify_packet<W>(
-    key: &Key,
-    value: &Option<Value>,
+async fn write_notify_packet<'a, W>(
+    key: &'a Key,
+    value: Option<&'a Value>,
     more: bool,
     socket: &mut W,
 ) -> Result<(), NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    W: LocalWriteAsync,
 {
     write_key(&key, socket).await?;
     write_optional_value(value, socket).await?;
@@ -102,19 +107,19 @@ where
 
 async fn write_bool<W>(val: bool, writer: &mut W) -> Result<(), NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    W: LocalWriteAsync,
 {
     if val {
-        writer.write_all(&[1]).await?;
+        writer.write_all(vec![  1 ]).await?;
     } else {
-        writer.write_all(&[0]).await?;
+        writer.write_all(vec![ 0 ]).await?;
     }
     Ok(())
 }
 
 async fn read_bool<R>(reader: &mut R) -> Result<bool, NetworkError>
 where
-    R: AsyncRead + Unpin,
+    R: LocalReadAsync
 {
     Ok(match reader.read_u8().await? {
         0 => false,
@@ -123,17 +128,17 @@ where
     })
 }
 
-async fn write_optional_value<W>(val: &Option<Value>, writer: &mut W) -> Result<(), NetworkError>
+async fn write_optional_value<'a, W>(val: Option<&'a Value>, writer: &mut W) -> Result<(), NetworkError>
 where
-    W: AsyncWrite + Unpin,
+    W: LocalWriteAsync,
 {
     match val {
         Some(v) => {
-            writer.write_all(&[1]).await?;
-            write_value(v, writer).await?;
+            writer.write_all(vec![ 1 ]).await?;
+            write_value(&v, writer).await?;
         }
         None => {
-            writer.write_all(&[0]).await?;
+            writer.write_all(vec![ 0 ]).await?;
         }
     }
     Ok(())
@@ -141,7 +146,7 @@ where
 
 async fn read_optional_value<R>(reader: &mut R) -> Result<Option<Value>, NetworkError>
 where
-    R: AsyncRead + Unpin,
+    R: LocalReadAsync,
 {
     Ok(match reader.read_u8().await? {
         0 => None,
@@ -150,7 +155,7 @@ where
     })
 }
 
-async fn write_watch_packet<W: AsyncWriteExt + Unpin>(
+async fn write_watch_packet<W: LocalWriteAsync>(
     key: &Key,
     activity: &WatcherActivity,
     behaviour: &WatcherBehaviour,
@@ -158,53 +163,53 @@ async fn write_watch_packet<W: AsyncWriteExt + Unpin>(
 ) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
     socket
-        .write_all(&[activity.discriminator(), behaviour.discriminator()])
+        .write_all([activity.discriminator(), behaviour.discriminator()].to_vec())
         .await?;
     Ok(())
 }
 
-async fn write_insert_packet<W: AsyncWriteExt + Unpin>(
-    key: &Key,
-    value: &Value,
+async fn write_insert_packet<'a, W: LocalWriteAsync>(
+    key: &'a Cow<'a, Key>,
+    value: &'a Cow<'a, Value>,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
     write_key(&key, socket).await?;
-    write_value(&value, socket).await?;
+    write_value(&**value, socket).await?;
     Ok(())
 }
 
-pub(crate) async fn write_value<W: AsyncWriteExt + Unpin>(
-    value: &Value,
+pub(crate) async fn write_value<'a, W: LocalWriteAsync>(
+    value: &'a Value,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    match value {
-        Value::String(s) => write_value_string(s, socket).await,
+    match &*value {
+        Value::String(s) => write_value_string(&*s, socket).await,
         Value::Integer(s) => write_value_integer(*s, socket).await,
     }
 }
 
-async fn write_value_string<W: AsyncWriteExt + Unpin>(
-    value: &str,
+async fn write_value_string<'a, W: LocalWriteAsync>(
+    value: &'a str,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    socket.write_all(&[0]).await?;
+    socket.write_all(vec![ 0 ]).await?;
     socket
-        .write_all(&(value.len() as u64).to_le_bytes())
+        .write_all((value.len() as u64).to_be_bytes().to_vec())
         .await?;
-    socket.write_all(value.as_bytes()).await?;
+    socket.write_all(value.as_bytes().to_vec()).await?;
     Ok(())
 }
 
-async fn write_value_integer<W: AsyncWriteExt + Unpin>(
+async fn write_value_integer<W: LocalWriteAsync>(
     value: i64,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    socket.write_all(&[1]).await?;
-    socket.write_all(&value.to_le_bytes()).await?;
+    socket.write_all([1].to_vec()).await?;
+    socket.write_all(value.to_be_bytes().to_vec()).await?;
     Ok(())
 }
 
-async fn write_delete_packet<W: AsyncWriteExt + Unpin>(
+async fn write_delete_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
@@ -212,7 +217,7 @@ async fn write_delete_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn write_get_packet<W: AsyncWriteExt + Unpin>(
+async fn write_get_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
@@ -220,7 +225,7 @@ async fn write_get_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn write_release_packet<W: AsyncWriteExt + Unpin>(
+async fn write_release_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
@@ -228,73 +233,74 @@ async fn write_release_packet<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-pub(crate) async fn write_key<W: AsyncWriteExt + Unpin>(
-    key: &Key,
+pub(crate) async fn write_key<'a, W: LocalWriteAsync>(
+    key: &'a Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
     socket
-        .write_all(&(key.as_str().len() as u32).to_le_bytes())
+        .write_all((key.as_str().len() as u32).to_be_bytes().to_vec())
         .await?;
-    socket.write_all(key.as_str().as_bytes()).await?;
+    socket.write_all(key.as_str().as_bytes().to_vec()).await?;
     Ok(())
 }
 
 // Decoder
 
 /// Reads a packet of the set type.
-async fn read_getreturn_packet<R: AsyncRead + Unpin>(
+async fn read_getreturn_packet<'a, R: LocalReadAsync>(
     socket: &mut R,
-) -> Result<PacketPayload, NetworkError> {
+) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
     let value = read_optional_value(socket).await?;
-    Ok(PacketPayload::Return { key, value })
+    Ok(PacketPayload::Return { key: Cow::Owned(key), value: value.map(|f| Cow::Owned(f)) })
 }
 /// Reads a packet of the set type.
-async fn read_notify_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_notify_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
     let value = read_optional_value(socket).await?;
     let more = read_bool(socket).await?;
-    Ok(PacketPayload::Notify { key, value, more })
+    Ok(PacketPayload::Notify { key: Cow::Owned(key), value: value.map(|f| Cow::Owned(f)), more })
 }
 
 /// Reads a packet of the set type.
-async fn read_delete_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_delete_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
+    println!("Reading delete packet...");
     let key = read_key(socket).await?;
-    Ok(PacketPayload::Delete { key })
+    Ok(PacketPayload::Delete { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
-async fn read_release_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_release_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
-    Ok(PacketPayload::Release { key })
+    Ok(PacketPayload::Release { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
-async fn read_get_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_get_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
-    Ok(PacketPayload::Get { key })
+    Ok(PacketPayload::Get { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
-async fn read_set_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_set_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
     let value = read_value(socket).await?;
-    Ok(PacketPayload::Insert { key, value })
+    Ok(PacketPayload::Insert { key: Cow::Owned(key), value: Cow::Owned(value) })
 }
 
 /// Reads a packet of the set type.
-async fn read_watch_packet<R: AsyncRead + Unpin>(socket: &mut R) -> Result<PacketPayload, NetworkError> {
+async fn read_watch_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     let key = read_key(socket).await?;
     let activity = WatcherActivity::try_from(socket.read_u8().await?)?;
     let behaviour = WatcherBehaviour::try_from(socket.read_u8().await?)?;
     Ok(PacketPayload::Watch {
-        key,
+        key: Cow::Owned(key),
         activity,
         behaviour,
     })
 }
 
-pub(crate) async fn read_value<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Value, NetworkError> {
+pub(crate) async fn read_value<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
     let type_discrim = socket.read_u8().await?;
     match type_discrim {
         0 => decode_value_string(socket).await,
@@ -303,22 +309,22 @@ pub(crate) async fn read_value<R: AsyncRead + Unpin>(socket: &mut R) -> Result<V
     }
 }
 
-async fn decode_value_integer<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Value, NetworkError> {
-    let value_length_buf = &mut [0u8; 8];
-    if socket.read_exact(value_length_buf).await? != 8 {
+async fn decode_value_integer<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
+    let mut value_length_buf = [0u8; 8];
+    if socket.read_exact(&mut value_length_buf).await? != 8 {
         return Err(NetworkError::FailedToReadValue);
     }
-    Ok(Value::Integer(i64::from_le_bytes(*value_length_buf)))
+    Ok(Value::Integer(i64::from_be_bytes(value_length_buf)))
 }
 
-async fn decode_value_string<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Value, NetworkError> {
-    let value_length_buf = &mut [0u8; 8];
-    if socket.read_exact(value_length_buf).await? != 8 {
+async fn decode_value_string<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
+    let mut value_length_buf = [0u8; 8];
+    if socket.read_exact(&mut value_length_buf).await? != 8 {
         return Err(NetworkError::FailedToReadValue);
     }
 
     // Figure out the size of the string.
-    let string_length = u64::from_le_bytes(*value_length_buf);
+    let string_length = u64::from_be_bytes(value_length_buf);
 
     let mut str_buf = vec![0u8; string_length as usize];
     socket.read_exact(&mut str_buf).await?;
@@ -330,34 +336,36 @@ async fn decode_value_string<R: AsyncRead + Unpin>(socket: &mut R) -> Result<Val
 
 pub(crate) async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
 where 
-    R: AsyncRead + Unpin
+    R: LocalReadAsync
 {
     // Check the key length, we will read this first before deferring.
-    let key_buf = &mut [0u8; 4];
-    let key_buf_size = socket.read_exact(key_buf).await?;
+    let mut key_buf = [0u8; 4];
+    let key_buf_size = socket.read_exact(&mut key_buf).await?;
 
     if key_buf_size != 4 {
         return Err(NetworkError::FailedToReadKey)?;
     }
 
+    println!("Key buf: {:?}", key_buf);
+
     // Now we have the key length.
     // We read the key.
-    let key_length = u32::from_le_bytes(*key_buf) as usize;
-    let key_bytes = &mut vec![0u8; key_length];
-    let read_b = socket.read(key_bytes).await?;
+    let key_length = u32::from_be_bytes(key_buf) as usize;
+    let mut key_bytes = vec![0u8; key_length];
+    let read_b = socket.read_exact(&mut key_bytes).await?;
     if read_b != key_length {
         return Err(NetworkError::FailedToReadKey)?;
     }
 
     // The key text.
     let key_text =
-        Key::from_str(std::str::from_utf8(key_bytes).map_err(|_| NetworkError::FailedToReadKey)?);
+        Key::from_str(std::str::from_utf8(&key_bytes).map_err(|_| NetworkError::FailedToReadKey)?);
     Ok(key_text)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
 
     use crate::{
         access::{WatcherActivity, WatcherBehaviour},
@@ -382,7 +390,8 @@ mod tests {
     #[tokio::test]
     pub async fn read_optional_value_test() {
         // Write a null.
-        let mut cursor = Cursor::new([0, 1, 1, 64, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut cursor = Cursor::new([0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 64, 0].to_vec());
+        
         assert_eq!(read_optional_value(&mut cursor).await.unwrap(), None);
         assert_eq!(
             read_optional_value(&mut cursor).await.unwrap(),
@@ -394,17 +403,17 @@ mod tests {
     pub async fn write_optional_value_test() {
         // Write a null.
         let mut cursor = vec![];
-        write_optional_value(&None, &mut cursor).await.unwrap();
+        write_optional_value(None, &mut cursor).await.unwrap();
         assert_eq!(cursor.len(), 1);
         assert_eq!(cursor[0], 0);
 
         // Write some value
         let mut cursor = vec![];
-        write_optional_value(&Some(Value::Integer(22)), &mut cursor)
+        write_optional_value(Some(&Value::Integer(22)), &mut cursor)
             .await
             .unwrap();
         assert_eq!(cursor.len(), 10);
-        assert_eq!(i64::from_le_bytes(cursor[2..10].try_into().unwrap()), 22);
+        assert_eq!(i64::from_be_bytes(cursor[2..10].try_into().unwrap()), 22);
     }
 
     #[tokio::test]
@@ -418,11 +427,13 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_notify_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Notify {
-            key: Key::from_str("hello"),
-            value: None,
-            more: false,
-        });
+        // let packet = Packet::new(PacketId::zero(), PacketPayload::Notify {
+        //     key: Key::from_str("hello"),
+        //     value: None,
+        //     more: false,
+        // });
+        let key = Key::from_str("hello");
+        let packet = Packet::new(PacketId::zero(), PacketPayload::notify(&key, None, false));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -440,9 +451,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_delete_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Delete {
-            key: Key::from_str("hello"),
-        });
+        let key = Key::from_str("hello");
+        let packet = Packet::new(PacketId::zero(), PacketPayload::delete(&key));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -458,9 +468,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_release_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Release {
-            key: Key::from_str("hello"),
-        });
+        let key = Key::from_str("hello");
+        let packet = Packet::new(PacketId::zero(), PacketPayload::release(&key));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -476,11 +485,12 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_watch_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Watch {
-            key: Key::from_str("hello"),
-            activity: WatcherActivity::Lazy,
-            behaviour: WatcherBehaviour::Eager,
-        });
+        let key = Key::from_str("hello");
+        let packet = Packet::new(PacketId::zero(), PacketPayload::watch(
+            &key,
+            WatcherActivity::Lazy,
+            WatcherBehaviour::Eager
+        ));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -503,10 +513,10 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_insert_string_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Insert {
-            key: "hello".into(),
-            value: Value::String("hello world".to_string()),
-        });
+
+        let key = Key::from_str("hello");
+        let value = Value::String("hello world".to_string());
+        let packet = Packet::new(PacketId::zero(), PacketPayload::insert(&key, &value));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -523,10 +533,9 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_insert_integer_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Insert {
-            key: "hello".into(),
-            value: Value::Integer(32),
-        });
+        let key = Key::from_str("hello");
+        let value = Value::Integer(32);
+        let packet = Packet::new(PacketId::zero(), PacketPayload::insert(&key, &value));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -543,9 +552,8 @@ mod tests {
 
     #[tokio::test]
     pub async fn write_get_packet() {
-        let packet = Packet::new(PacketId::zero(), PacketPayload::Get {
-            key: "hello".into(),
-        });
+        let key = Key::from_str("hello");
+        let packet = Packet::new(PacketId::zero(), PacketPayload::get(&key));
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
@@ -563,11 +571,11 @@ mod tests {
     pub async fn read_release_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 3u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         if let PacketPayload::Release { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
         }
@@ -577,20 +585,20 @@ mod tests {
     pub async fn read_notify_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 5u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         // 1 = Some
         // 1 = Integer
         // 64 0 0 0 0 0 0 0 = A i64 of 64
         // 1 = True
-        buffer.extend_from_slice(&[1, 1, 64, 0, 0, 0, 0, 0, 0, 0, 1]);
+        buffer.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 64, 1]);
 
         if let PacketPayload::Notify { key, value, more } =
             Packet::read(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
-            assert_eq!(*key, Key::from_str(skey));
-            assert_eq!(*value.as_ref().unwrap(), Value::Integer(64));
+            assert_eq!(**key, Key::from_str(skey));
+            assert_eq!(**value.as_ref().unwrap(), Value::Integer(64));
             assert!(more);
         } else {
             panic!("Packet did not decode as the proper type.");
@@ -601,7 +609,7 @@ mod tests {
     pub async fn read_watch_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 2u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         buffer.push(1);
@@ -613,7 +621,7 @@ mod tests {
             behaviour,
         } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
             assert_eq!(*activity, WatcherActivity::Lazy);
             assert_eq!(*behaviour, WatcherBehaviour::Ordered);
         } else {
@@ -625,11 +633,13 @@ mod tests {
     pub async fn read_delete_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 4u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
+        println!("Hello");
+
         if let PacketPayload::Delete { key } = Packet::read(&mut Cursor::new(buffer)).await.unwrap().payload() {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
         }
@@ -639,11 +649,11 @@ mod tests {
     pub async fn read_get_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 1u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         if let PacketPayload::Get { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
         }
@@ -653,16 +663,16 @@ mod tests {
     pub async fn read_integer_insert_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         let svalue: i64 = 382;
         buffer.push(1);
-        buffer.extend_from_slice(&svalue.to_le_bytes());
+        buffer.extend_from_slice(&svalue.to_be_bytes());
 
         if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
             assert_eq!(value.as_integer().unwrap(), svalue);
         } else {
             panic!("Packet did not decode as the proper type.");
@@ -673,17 +683,17 @@ mod tests {
     pub async fn read_string_insert_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_le_bytes());
+        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         let svalue = "I am a string to be set.";
         buffer.push(0);
-        buffer.extend_from_slice(&(svalue.as_bytes().len() as u64).to_le_bytes());
+        buffer.extend_from_slice(&(svalue.as_bytes().len() as u64).to_be_bytes());
         buffer.extend_from_slice(svalue.as_bytes());
 
         if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
-            assert_eq!(*key, Key::from_str(skey));
+            assert_eq!(**key, Key::from_str(skey));
             assert_eq!(value.as_string().unwrap(), svalue);
         } else {
             panic!("Packet did not decode as the proper type.");

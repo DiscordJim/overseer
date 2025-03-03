@@ -36,7 +36,7 @@ struct Inner {
     write: Mutex<Option<(OwnedWriteHalf, Arc<Notify>)>>,
     counter: AtomicU32,
     signal: Notify,
-    channels: DashMap<u32, Sender<Packet>>,
+    channels: DashMap<u32, Sender<Packet<'static>>>,
     watched: DashMap<Key, LiveValue>
     // channel: 
 }
@@ -66,7 +66,7 @@ async fn run_client_backend(mut read: OwnedReadHalf, kill: Arc<Notify>, inner: A
         if packet_id.id() == 0 {
             if let PacketPayload::Notify { key, value, .. } = packet.payload() {
                 let live_value = &*inner.watched.get(key).unwrap().value;
-                *live_value.value.lock().await = value.clone();
+                *live_value.value.lock().await = value.as_deref().cloned();
                 live_value.notify.notify_waiters();
             }
         } else {
@@ -115,7 +115,8 @@ impl Client {
 
             let notif = Arc::new(Notify::new());
 
-            tokio::spawn(run_client_backend(read, notif.clone(), Arc::clone(&self.inner)));
+            // TODO: REINTRODUCE
+            // tokio::spawn(run_client_backend(read, notif.clone(), Arc::clone(&self.inner)));
             
             self.inner.signal.notified().await;
             *self.inner.write.lock().await = Some((write, notif));
@@ -123,7 +124,7 @@ impl Client {
         }
         Ok(())
     }
-    async fn send(&self, packet: Packet) -> Result<Packet, NetworkError> {
+    async fn send(&self, packet: Packet<'static>) -> Result<Packet, NetworkError> {
         let mut handle = self.inner.write.lock().await;
         let (stream, _) = handle.as_mut().unwrap();
 
@@ -139,36 +140,30 @@ impl Client {
     fn count(&self) -> u32 {
         self.inner.counter.fetch_add(1, Ordering::AcqRel)
     }
-    pub async fn get<K>(&self, key: K) -> Result<Option<Value>, NetworkError>
-    where 
-        K: Borrow<Key>
+    pub async fn get(&self, key: &Key) -> Result<Option<Value>, NetworkError>
     {
         self.connect().await?;
 
-        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::get(key));
+        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::get(key)).to_owned();
         if let PacketPayload::Return { value, .. } = self.send(packet).await?.payload() {
-            return Ok(value.clone());
+            return Ok(value.as_deref().cloned());
         } else {
             return Err(NetworkError::WrongResponseFromServer);
         }
     }
-    pub async fn delete<K>(&self, key: K) -> Result<(), NetworkError>
-    where 
-        K: Borrow<Key>
+    pub async fn delete(&self, key: &Key) -> Result<(), NetworkError>
     {
         self.connect().await?;
 
    
-        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::delete(key));
+        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::delete(key)).to_owned();
         if let PacketPayload::Get { .. } = self.send(packet).await?.payload() {
             return Ok(());
         } else {
             return Err(NetworkError::WrongResponseFromServer);
         }
     }
-    pub async fn insert<K>(&self, key: K, value: Value) -> Result<Option<Value>, NetworkError>
-    where 
-        K: Borrow<Key>
+    pub async fn insert(&self, key: &Key, value: Value) -> Result<Option<Value>, NetworkError>
     {
         self.connect().await?;
 
@@ -178,17 +173,15 @@ impl Client {
         //     return Err(NetworkError::WrongResponseFromServer);
         // }
         println!("Hello");
-        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::insert(key, value));
+        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::insert(key, &value)).to_owned();
         if let PacketPayload::Return { value, .. } = self.send(packet).await?.payload() {
-            return Ok(value.clone());
+            return Ok(value.as_deref().cloned());
         } else {
             return Err(NetworkError::WrongResponseFromServer);
         }
         // Ok(None)
     }
-    pub async fn subscribe<K>(&self, key: K, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Result<LiveValue, NetworkError>
-    where 
-        K: Borrow<Key>
+    pub async fn subscribe(&self, key: &Key, activity: WatcherActivity, behaviour: WatcherBehaviour) -> Result<LiveValue, NetworkError>
     {
         self.connect().await?;
 
@@ -200,7 +193,7 @@ impl Client {
         };
 
         self.inner.watched.insert(key.borrow().clone(), inner.clone());
-        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::watch(key, activity, behaviour));
+        let packet = Packet::new(PacketId::new(self.count(), 0), PacketPayload::watch(key, activity, behaviour)).to_owned();
         
         if let PacketPayload::Get { .. } = self.send(packet).await?.payload() {
             return Ok(inner);
