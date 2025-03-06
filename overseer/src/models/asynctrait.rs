@@ -1,10 +1,111 @@
-use std::{future::Future, io::{Cursor, Read}, pin::Pin, task::{Context, Poll}};
+use std::{fmt::Debug, ops};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use monoio::buf::{IoBuf, IoBufMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::error::NetworkError;
+
+// pub trait Bidirectional<O> {
+//     fn forwards(self) -> O;
+//     fn backwards(o: O) -> Self; 
+// }
+
+// impl<B, O> Bidirectional<B> for O
+// where 
+//     B: Bidirectional<O>
+// {
+//     fn forwards(self) -> B {
+//         B::backwards(self)
+//     }
+//     fn backwards(o: B) -> Self {
+//         B::forwards(o)
+//     }
+
+// }
+
+// impl Bidirectional<IoBufferMut> for Vec<u8> {
+//     fn backwards(o: IoBufferMut) -> Self {
+//         if let IoBufferMut::Heap(h) = o {
+//             h
+//         } else {
+//             panic!("Tried to flip an IO buffer illegally.")
+//         }
+//     }
+//     fn forwards(self) -> IoBufferMut {
+//         IoBufferMut::Heap(self)
+//     }
+// }
+
+// impl<const N: usize> Bidirectional<IoBufferMut<N>> for [u8; N] {
+//     fn backwards(o: IoBufferMut<N>) -> Self {
+//         if let IoBufferMut::Slice(h) = o {
+//             h
+//         } else {
+//             panic!("Tried to flip an IO buffer illegally.")
+//         }
+//     }
+//     fn forwards(self) -> IoBufferMut<N> {
+//         IoBufferMut::Slice(self)
+//     }
+// }
 
 
+pub enum IoBufferMut<const N: usize = 0> {
+    Heap(Vec<u8>),
+    Slice(&'static [u8; N])
+}
+
+impl Into<IoBufferMut<0>> for Vec<u8> {
+    fn into(self) -> IoBufferMut<0> {
+        IoBufferMut::Heap(self)
+    }
+}
+impl<const N: usize> Into<IoBufferMut<N>> for &'static [u8; N] {
+    fn into(self) -> IoBufferMut<N> {
+        IoBufferMut::Slice(self)
+    }
+}
+
+impl<const N: usize> IoBufferMut<N> {
+    pub fn slice(self) -> &'static [u8; N] {
+        if let Self::Slice(s) = self {
+            s
+        } else {
+            panic!("Illegal buffer conversion....");
+        }
+    }
+    pub fn heap(self) -> Vec<u8> {
+        if let Self::Heap(h) = self {
+            h
+        } else {
+            panic!("Illegal buffer conversion....");
+        }
+    }
+}
+
+
+
+
+// pub trait IoBufferMut: Debug {
+//     fn as_mut(&mut self) -> Option<&mut [u8]>;
+// }
+
+// impl<const N: usize> IoBufferMut for [u8; N] {
+//     fn as_mut(&mut self) -> Option<&mut [u8]> {
+//         Some(self)
+//     }
+// }
+
+// impl IoBufferMut for Vec<u8> {
+//     fn as_mut(&mut self) -> Option<&mut [u8]> {
+//         Some(&mut *self)
+//     }
+// }
+
+// unsafe impl<T: IoBufMut> IoBufferMut for T {
+//     fn as_mut(&mut self) -> Option<&mut [u8]> {
+//         unsafe { self.write_ptr() }
+//     }
+// }
 
 
 
@@ -12,16 +113,16 @@ use crate::error::NetworkError;
 
 #[async_trait::async_trait(?Send)]
 pub trait LocalReadAsync: Sized {
-    async fn read_exact<T: AsMut<[u8]>>(&mut self, mut buffer: T) -> std::io::Result<usize>;
+    async fn read_exact(&mut self, buffer: Vec<u8>) -> std::io::Result<(Vec<u8>, usize)>;
     async fn read_u8(&mut self) -> std::io::Result<u8> {
-        let mut single = [0u8; 1];
-        self.read_exact(&mut single).await?;
+        let single = [0u8; 1];
+        let (single, _) = self.read_exact(single.to_vec()).await?;
+        // println!("SINGLE: {:?}", single);
         Ok(single[0])
     }
     async fn read_u32(&mut self) -> std::io::Result<u32> {
-        let mut single = [0u8; 4];
-        self.read_exact(&mut single).await?;
-        Ok(u32::from_be_bytes(single))
+        let (d, _) = self.read_exact(vec![0u8; 4]).await?;
+        Ok(u32::from_be_bytes(d[0..4].try_into().unwrap()))
     }
 }
 
@@ -40,24 +141,16 @@ pub trait LocalWriteAsync {
 }
 
 
-// impl LocalReadAsync for Cursor<Vec<u8>> {
-//     async fn read_exact<T: AsMut<[u8]>>(&mut self, mut buffer: T) -> Result<usize, NetworkError> {
-//         Read::read_exact(self, buffer.as_mut())?;
-//         Ok(0)
-//     }
-// }
+
 
 #[async_trait::async_trait(?Send)]
 impl<S: AsyncReadExt + Unpin + Sized> LocalReadAsync for S {
-    async fn read_exact<T: AsMut<[u8]>>(&mut self, mut buffer: T) -> std::io::Result<usize> {
-        Ok(AsyncReadExt::read_exact(self, buffer.as_mut()).await?)
+    async fn read_exact(&mut self, mut buffer: Vec<u8>) -> std::io::Result<(Vec<u8>, usize)> {
+
+        let r= AsyncReadExt::read_exact(self, buffer.as_mut()).await?;
+        // println!("Read: {} {:?}", r, buffer);
+        Ok((buffer, r))
     }
-    // async fn read_exact<B: AsMut<[u8]>>(&mut self, mut buffer: B) -> Result<usize, NetworkError> {
-    //     Ok(AsyncReadExt::read_exact(self, buffer.as_mut()).await?)
-    // }
-    // fn read_exact<J: AsMut<[u8]>>(&mut self, mut buffer: J) -> impl Future<Output = Result<usize, NetworkError>> {
-    //     AsyncReadExt::read_exact(self, buffer.as_mut())
-    // }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -65,10 +158,4 @@ impl<S: AsyncWriteExt + Unpin + Sized> LocalWriteAsync for S {
     async fn write_all(&mut self, buffer: Vec<u8>) -> std::io::Result<()> {
         Ok(AsyncWriteExt::write_all(self, &buffer).await?)
     }
-    // async fn read_exact<B: AsMut<[u8]>>(&mut self, mut buffer: B) -> Result<usize, NetworkError> {
-    //     Ok(AsyncReadExt::read_exact(self, buffer.as_mut()).await?)
-    // }
-    // fn read_exact<J: AsMut<[u8]>>(&mut self, mut buffer: J) -> impl Future<Output = Result<usize, NetworkError>> {
-    //     AsyncReadExt::read_exact(self, buffer.as_mut())
-    // }
 }

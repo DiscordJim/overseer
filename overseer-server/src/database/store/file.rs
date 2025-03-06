@@ -1,7 +1,11 @@
-use std::{fmt::UpperHex, path::Path};
+use std::{fmt::UpperHex, io, path::Path};
 
 use monoio::fs::{File, OpenOptions};
-use overseer::error::NetworkError;
+use overseer::{error::NetworkError, models::{asynctrait, IoBufferMut, LocalReadAsync}};
+
+use super::paging::meta::{PageType, RawPageAddress};
+
+
 
 pub const MAGIC_BYTE: u8 = 0x83;
 pub const PAGE_SIZE: usize = 4096;
@@ -17,6 +21,24 @@ pub struct PagedFile {
     is_initialized: bool,
     free_list: Vec<RawPageAddress>
 }
+
+
+pub struct PagedFileRw<'a> {
+    position: usize,
+    underlying: &'a PagedFile
+}
+
+#[async_trait::async_trait(?Send)]
+impl LocalReadAsync for PagedFileRw<'_> {
+    async fn read_exact(&mut self, buffer: Vec<u8>) -> std::io::Result<(Vec<u8>, usize)> {
+        let (error, buffer) = self.underlying.underlying.read_exact_at(buffer, self.position as u64).await;
+        error?; // propagate.
+        let length = buffer.len();
+        self.position += length;
+        Ok((buffer, length))
+    }
+}
+
 
 
 impl PagedFile {
@@ -57,6 +79,15 @@ impl PagedFile {
         Ok(object)
         
 
+    }
+    pub fn reader(&self, position: usize) -> PagedFileRw<'_> {
+        PagedFileRw {
+            position,
+            underlying: self
+        }
+    }
+    pub fn handle(&self) -> &File {
+        &self.underlying
     }
     fn header_page(&self) -> Page {
         Page {
@@ -136,60 +167,8 @@ pub struct Page {
     next: RawPageAddress
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct RawPageAddress(u32);
 
-impl RawPageAddress {
-    pub fn new(inner: u32) -> Self {
-        Self(inner)
-    }
-    pub fn is_zero(&self) -> bool {
-        self.0 == 0
-    }
-    pub fn as_u64(&self) -> u64 {
-        self.0 as u64
-    }
-    pub fn zero() -> Self {
-        Self::new(0)
-    }
-    pub fn offset(self, o: u32) -> Self
-    {
-        Self(self.0 + o)
-    }
-    pub fn offset_subtract(self, o: u32) -> Self {
-        Self(self.0 - o)
-    }
-    pub fn page_number(&self) -> u32 {
-        if self.is_zero() {
-            0
-        } else {
-            (self.0 - RESERVED_HEADER_SIZE) / PAGE_SIZE as u32
-        }
-        
-    }
-}
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum PageType {
-    Normal,
-    Dummy
-}
-
-impl PageType {
-    pub fn as_u8(&self) -> u8 {
-        match self {
-            Self::Normal => 0,
-            Self::Dummy => 1
-        }
-    }
-    pub fn from_u8(discrim: u8) -> Result<Self, NetworkError> {
-        Ok(match discrim {
-            0 => Self::Normal,
-            1 => Self::Dummy,
-            _ => Err(NetworkError::ErrorDecodingBoolean)?
-        })
-    }
-}
 
 async fn format_pagefile_header(file: &PagedFile, page: &Page) -> Result<(), NetworkError>
 {
@@ -238,6 +217,9 @@ async fn format_page(file: &PagedFile, page: &mut Page) -> Result<(), NetworkErr
 }
 
 impl Page {
+    pub fn get_write_ptr(&self, position: u32) -> RawPageAddress {
+        self.start.offset(position).offset(PAGE_HEADER_RESERVED_BYTES as u32)
+    }
     fn bound_check(&self, position: u32, size: u32) -> Result<(), NetworkError> {
         if (position + size) > self.size {
             return Err(NetworkError::IllegalRead)?;
@@ -252,7 +234,7 @@ impl Page {
     }
     pub async fn read(&self, file: &PagedFile, position: u32, size: u32) -> Result<Vec<u8>, NetworkError> {
         self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, size)?;
-        let (r, buf) = file.underlying.read_exact_at(Vec::with_capacity(size as usize), self.start.offset(position).offset(PAGE_HEADER_RESERVED_BYTES as u32).as_u64()).await;
+        let (r, buf) = file.underlying.read_exact_at(Vec::with_capacity(size as usize), self.get_write_ptr(position).as_u64()).await;
         r?;
         Ok(buf)
     }
@@ -265,7 +247,7 @@ impl Page {
     
     pub async fn write(&self, file: &PagedFile, position: u32, bytes: Vec<u8>) -> Result<Vec<u8>, NetworkError> {
         self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, bytes.len() as u32)?;
-        let (r, buf) = file.underlying.write_all_at(bytes, self.start.offset(position as u32).offset(PAGE_HEADER_RESERVED_BYTES as u32).as_u64()).await;
+        let (r, buf) = file.underlying.write_all_at(bytes, self.get_write_ptr(position).as_u64()).await;
         r?;
         Ok(buf)
     }
@@ -313,8 +295,11 @@ impl Page {
             Ok(o)
         }
     }
+    pub fn full_size(&self) -> u32 {
+        self.size
+    }
     pub fn capacity(&self) -> u32 {
-        self.size - PAGE_HEADER_RESERVED_BYTES 
+        self.full_size() - PAGE_HEADER_RESERVED_BYTES 
     }
     pub async fn view(&self, file: &PagedFile) -> Result<[u8; PAGE_SIZE], NetworkError> {
         Ok(self.raw_read(file, 0, PAGE_SIZE as u32).await?.try_into().unwrap())

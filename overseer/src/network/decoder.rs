@@ -322,7 +322,9 @@ pub trait OverseerSerde<O: Sized>: Sized {
 impl OverseerSerde<bool> for bool {
     type E = std::io::Error;
     async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<bool, Self::E> {
-        Ok(match reader.read_u8().await? {
+        let b = reader.read_u8().await? ;
+        // println!("Acked: {b}");
+        Ok(match b {
             0 => false,
             1 => true,
             _ => Err(std::io::Error::new(ErrorKind::InvalidData, "Could not decode boolean."))?,
@@ -402,8 +404,8 @@ impl<'a> OverseerSerde<String> for &'a str {
             return Ok(String::default());
         }
 
-        let mut str_buf = vec![0u8; string_length as usize];
-        reader.read_exact(&mut str_buf).await?;
+        let str_buf = vec![0u8; string_length as usize];
+        let (str_buf, _) = reader.read_exact(str_buf).await?;
 
         Ok(
             String::from_utf8(str_buf).map_err(|_| NetworkError::FailedToReadValue)?,
@@ -461,6 +463,7 @@ mod tests {
     pub async fn read_bool_test() {
         let mut cursor = Cursor::new(vec![0, 1]);
         assert_eq!(bool::deserialize(&mut cursor).await.unwrap(), false);
+        println!("REad...");
         assert_eq!(bool::deserialize(&mut cursor).await.unwrap(), true);
     }
 
