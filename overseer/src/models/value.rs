@@ -39,14 +39,14 @@ impl Value {
             Self::Integer(..) => 1
         }
     }
-    pub fn decode(discrim: u8, bytes: &[u8]) -> Result<Self, NetworkError> {
+    // pub fn decode(discrim: u8, bytes: &[u8]) -> Result<Self, NetworkError> {
     
-        match discrim {
-            0 => Ok(Self::String(std::str::from_utf8(bytes)?.to_string())),
-            1 => Ok(Self::Integer(i64::from_le_bytes(bytes.try_into()?))),
-            x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x))
-        }
-    }
+    //     match discrim {
+    //         0 => Ok(Self::String(std::str::from_utf8(bytes)?.to_string())),
+    //         1 => Ok(Self::Integer(i64::from_le_bytes(bytes.try_into()?))),
+    //         x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x))
+    //     }
+    // }
     pub fn type_name(&self) -> &'static str {
         match self {
             Self::String(..) => "string",
@@ -67,12 +67,12 @@ impl Value {
             Err(ValueParseError::IncorrectType(format!("Tried to parse as integer but was {}.", self.type_name())))
         }
     }
-    pub fn as_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Integer(i) => i.to_le_bytes().to_vec(),
-            Self::String(s) => s.as_bytes().to_vec()
-        }
-    }
+    // pub fn as_bytes(&self) -> Vec<u8> {
+    //     match self {
+    //         Self::Integer(i) => i.to_le_bytes().to_vec(),
+    //         Self::String(s) => s.as_bytes().to_vec()
+    //     }
+    // }
 }
 
 impl Into<Value> for i64 {

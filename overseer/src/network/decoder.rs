@@ -8,7 +8,7 @@ use crate::{
     models::{Key, LocalReadAsync, LocalWriteAsync, Value},
 };
 
-use super::{Packet, PacketId, PacketPayload, CURRENT_VERSION};
+use super::{OvrInteger, Packet, PacketId, PacketPayload, CURRENT_VERSION};
 
 
 // Encoder
@@ -184,28 +184,37 @@ pub(crate) async fn write_value<'a, W: LocalWriteAsync>(
 ) -> Result<(), NetworkError> {
     match &*value {
         Value::String(s) => write_value_string(&*s, socket).await,
-        Value::Integer(s) => write_value_integer(*s, socket).await,
+        Value::Integer(s) => write_value_signed_integer(*s, socket).await,
     }
 }
 
+#[inline]
 async fn write_value_string<'a, W: LocalWriteAsync>(
     value: &'a str,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
     socket.write_all(vec![ 0 ]).await?;
-    socket
-        .write_all((value.len() as u64).to_be_bytes().to_vec())
-        .await?;
+    write_string(value, socket).await?;
+    Ok(())
+}
+
+#[inline]
+async fn write_string<'a, W: LocalWriteAsync>(
+    value: &'a str,
+    socket: &mut W,
+) -> Result<(), NetworkError> {
+    OvrInteger::write(value.len(), socket).await?;
     socket.write_all(value.as_bytes().to_vec()).await?;
     Ok(())
 }
 
-async fn write_value_integer<W: LocalWriteAsync>(
+async fn write_value_signed_integer<W: LocalWriteAsync>(
     value: i64,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
     socket.write_all([1].to_vec()).await?;
-    socket.write_all(value.to_be_bytes().to_vec()).await?;
+    OvrInteger::write(value, socket).await?;
+    // socket.write_all(value.to_be_bytes().to_vec()).await?;
     Ok(())
 }
 
@@ -237,11 +246,7 @@ pub(crate) async fn write_key<'a, W: LocalWriteAsync>(
     key: &'a Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    socket
-        .write_all((key.as_str().len() as u32).to_be_bytes().to_vec())
-        .await?;
-    socket.write_all(key.as_str().as_bytes().to_vec()).await?;
-    Ok(())
+   write_string(key.as_str(), socket).await
 }
 
 // Decoder
@@ -304,27 +309,24 @@ pub(crate) async fn read_value<R: LocalReadAsync>(socket: &mut R) -> Result<Valu
     let type_discrim = socket.read_u8().await?;
     match type_discrim {
         0 => decode_value_string(socket).await,
-        1 => decode_value_integer(socket).await,
+        1 => decode_value_signed_integer(socket).await,
         x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x)),
     }
 }
 
-async fn decode_value_integer<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
-    let mut value_length_buf = [0u8; 8];
-    if socket.read_exact(&mut value_length_buf).await? != 8 {
-        return Err(NetworkError::FailedToReadValue);
-    }
-    Ok(Value::Integer(i64::from_be_bytes(value_length_buf)))
+async fn decode_value_signed_integer<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
+    let val: i64 = OvrInteger::read(socket).await?;
+    Ok(Value::Integer(val))
 }
 
 async fn decode_value_string<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
-    let mut value_length_buf = [0u8; 8];
-    if socket.read_exact(&mut value_length_buf).await? != 8 {
-        return Err(NetworkError::FailedToReadValue);
-    }
 
     // Figure out the size of the string.
-    let string_length = u64::from_be_bytes(value_length_buf);
+    let string_length: u64 = OvrInteger::read(socket).await?;
+
+    if string_length == 0 {
+        return Ok(Value::String("".to_string()));
+    }
 
     let mut str_buf = vec![0u8; string_length as usize];
     socket.read_exact(&mut str_buf).await?;
@@ -338,42 +340,24 @@ pub(crate) async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
 where 
     R: LocalReadAsync
 {
-    // Check the key length, we will read this first before deferring.
-    let mut key_buf = [0u8; 4];
-    let key_buf_size = socket.read_exact(&mut key_buf).await?;
-
-    if key_buf_size != 4 {
-        return Err(NetworkError::FailedToReadKey)?;
+    if let Value::String(inner) = decode_value_string(socket).await? {
+        Ok(Key::from_str(&inner ))
+    } else {
+        Err(NetworkError::FailedToReadKey)
     }
-
-    println!("Key buf: {:?}", key_buf);
-
-    // Now we have the key length.
-    // We read the key.
-    let key_length = u32::from_be_bytes(key_buf) as usize;
-    let mut key_bytes = vec![0u8; key_length];
-    let read_b = socket.read_exact(&mut key_bytes).await?;
-    if read_b != key_length {
-        return Err(NetworkError::FailedToReadKey)?;
-    }
-
-    // The key text.
-    let key_text =
-        Key::from_str(std::str::from_utf8(&key_bytes).map_err(|_| NetworkError::FailedToReadKey)?);
-    Ok(key_text)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read};
+    use std::io::{Cursor, Read, Write};
 
     use crate::{
         access::{WatcherActivity, WatcherBehaviour},
-        models::{Key, Value},
+        models::{Key, LocalWriteAsync, Value},
         network::{decoder::{
             read_bool, read_optional_value, read_packet, write_bool, write_optional_value,
             write_packet,
-        }, PacketId, PacketPayload},
+        }, OvrInteger, PacketId, PacketPayload},
     };
 
     use super::Packet;
@@ -390,8 +374,13 @@ mod tests {
     #[tokio::test]
     pub async fn read_optional_value_test() {
         // Write a null.
-        let mut cursor = Cursor::new([0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 64, 0].to_vec());
-        
+        let mut cursor = Cursor::new(vec![]);
+        LocalWriteAsync::write_all(&mut cursor, vec![0u8, 1u8, 1u8]).await.unwrap();
+        OvrInteger::write(64i64, &mut cursor).await.unwrap();
+        cursor.set_position(0);
+
+
+
         assert_eq!(read_optional_value(&mut cursor).await.unwrap(), None);
         assert_eq!(
             read_optional_value(&mut cursor).await.unwrap(),
@@ -408,12 +397,13 @@ mod tests {
         assert_eq!(cursor[0], 0);
 
         // Write some value
-        let mut cursor = vec![];
+        let mut cursor = Cursor::new(vec![]);
         write_optional_value(Some(&Value::Integer(22)), &mut cursor)
             .await
             .unwrap();
-        assert_eq!(cursor.len(), 10);
-        assert_eq!(i64::from_be_bytes(cursor[2..10].try_into().unwrap()), 22);
+        // assert_eq!(cursor.len(), 3);
+        cursor.set_position(2);
+        assert_eq!(OvrInteger::read::<i64, _>(&mut cursor).await.unwrap(), 22);
     }
 
     #[tokio::test]
@@ -571,7 +561,7 @@ mod tests {
     pub async fn read_release_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 3u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
         if let PacketPayload::Release { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
@@ -585,14 +575,17 @@ mod tests {
     pub async fn read_notify_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 5u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
         // 1 = Some
         // 1 = Integer
         // 64 0 0 0 0 0 0 0 = A i64 of 64
         // 1 = True
-        buffer.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0, 0, 64, 1]);
+        LocalWriteAsync::write_all(&mut buffer, vec![1, 1]).await.unwrap();
+        OvrInteger::write(64, &mut buffer).await.unwrap();
+        LocalWriteAsync::write_all(&mut buffer, vec![1]).await.unwrap();
+        // buffer.extend_from_slice(&vec![1, 1].into_iter().chain(Ov).chain(vec![1]).collect::<Vec<u8>>());
 
         if let PacketPayload::Notify { key, value, more } =
             Packet::read(&mut Cursor::new(buffer)).await.unwrap().payload()
@@ -609,7 +602,7 @@ mod tests {
     pub async fn read_watch_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 2u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
         buffer.push(1);
@@ -633,7 +626,7 @@ mod tests {
     pub async fn read_delete_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 4u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
         println!("Hello");
@@ -649,7 +642,8 @@ mod tests {
     pub async fn read_get_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 1u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
+        // buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
         if let PacketPayload::Get { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
@@ -663,17 +657,18 @@ mod tests {
     pub async fn read_integer_insert_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
-        let svalue: i64 = 382;
+        // let svalue: i64 = 382;
         buffer.push(1);
-        buffer.extend_from_slice(&svalue.to_be_bytes());
+        OvrInteger::write(382i64, &mut buffer).await.unwrap();
+        // buffer.extend_from_slice(&svalue.to_be_bytes());
 
         if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
             assert_eq!(**key, Key::from_str(skey));
-            assert_eq!(value.as_integer().unwrap(), svalue);
+            assert_eq!(value.as_integer().unwrap(), 382);
         } else {
             panic!("Packet did not decode as the proper type.");
         }
@@ -683,12 +678,12 @@ mod tests {
     pub async fn read_string_insert_packet() {
         let skey = "hello";
         let mut buffer = vec![0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0u8];
-        buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
+        OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
         let svalue = "I am a string to be set.";
         buffer.push(0);
-        buffer.extend_from_slice(&(svalue.as_bytes().len() as u64).to_be_bytes());
+        OvrInteger::write(svalue.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(svalue.as_bytes());
 
         if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()

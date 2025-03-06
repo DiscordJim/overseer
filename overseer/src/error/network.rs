@@ -36,8 +36,6 @@ pub enum NetworkError {
     ErrorDecodingBoolean,
     #[error("Unknown packet schema")]
     UnknownPacketSchema(u8),
-    #[error("Storage error")]
-    StorageError(#[from] sqlx::error::Error),
     #[error("Could not conver from slice")]
     TrySliceError(#[from] std::array::TryFromSliceError),
     #[error("Could not convert from slice")]
