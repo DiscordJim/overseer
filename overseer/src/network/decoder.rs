@@ -15,69 +15,68 @@ use super::{OvrInteger, Packet, PacketId, PacketPayload, CURRENT_VERSION};
 
 // Encoder
 
-pub(crate) async fn write_packet<'a, W>(packet: &Packet<'a>, socket: &mut W) -> Result<(), NetworkError>
-where
-    W: LocalWriteAsync,
-{
-    socket.write_u8(CURRENT_VERSION).await?;
-    socket.write_u32(packet.id().id()).await?;
-    socket.write_u32(packet.id().order()).await?;
-    // socket.write_i64(packet.id()).await?;
-    socket.write_u8(packet.payload().discriminator()).await?;
-    match packet.payload() {
-        PacketPayload::Get { key } => write_get_packet(key, socket).await,
-        PacketPayload::Insert { key, value } => write_insert_packet(key, value, socket).await,
-        PacketPayload::Release { key } => write_release_packet(key, socket).await,
-        PacketPayload::Watch {
-            key,
-            activity,
-            behaviour,
-        } => write_watch_packet(key, activity, behaviour, socket).await,
-        PacketPayload::Delete { key } => write_delete_packet(key, socket).await,
-        PacketPayload::Notify { key, value, more } => write_notify_packet(key, value.as_deref(), *more, socket).await,
-        PacketPayload::Return { key, value } => write_getreturn_packet(key, value.as_deref(), socket).await,
+impl OverseerSerde<Packet<'static>> for Packet<'_> {
+    type E = NetworkError;
+    async fn serialize<W: LocalWriteAsync>(&self, socket: &mut W) -> Result<(), Self::E> {
+        socket.write_u8(CURRENT_VERSION).await?;
+        socket.write_u32(self.id().id()).await?;
+        socket.write_u32(self.id().order()).await?;
+        socket.write_u8(self.payload().discriminator()).await?;
+        self.payload().serialize(socket).await?;
+        Ok(())
+    }
+    async fn deserialize<R: LocalReadAsync>(socket: &mut R) -> Result<Packet<'static>, Self::E> {
+        let version = socket.read_u8().await?;
+
+        let id_first = socket.read_u32().await?;
+        let id_second = socket.read_u32().await?;
+
+
+
+        Ok(Packet::new(
+            PacketId::new(id_first, id_second),
+            match version {
+                0 => PacketPayload::deserialize(socket).await?,
+                x => Err(NetworkError::UnknownPacketSchema(x))?,
+            }
+        ))
     }
 }
 
-/// Reads a packet by deferring to submethods.
-pub(crate) async fn read_packet<R>(socket: &mut R) -> Result<Packet<'static>, NetworkError>
-where
-    R: LocalReadAsync
-{
 
-    let version = socket.read_u8().await?;
-
-    let id_first = socket.read_u32().await?;
-    let id_second = socket.read_u32().await?;
-
-    // println!("{version} {id_first} {id_second}");
-    // let id = socket.read_i64().await?;
-
-    Ok(Packet::new(
-        PacketId::new(id_first, id_second),
-        match version {
-            0 => read_packet_v0(socket).await?,
-            x => Err(NetworkError::UnknownPacketSchema(x))?,
+impl OverseerSerde<PacketPayload<'static>> for PacketPayload<'_> {
+    type E = NetworkError;
+    async fn deserialize<R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'static>, Self::E> {
+        let discrim = socket.read_u8().await?;
+        match discrim {
+            0 => read_set_packet(socket).await,
+            1 => read_get_packet(socket).await,
+            2 => read_watch_packet(socket).await,
+            3 => read_release_packet(socket).await,
+            4 => read_delete_packet(socket).await,
+            5 => read_notify_packet(socket).await,
+            6 => read_getreturn_packet(socket).await,
+            x => Err(NetworkError::UnrecognizedPacketTypeDiscriminator(x)),
         }
-    ))
-}
-
-async fn read_packet_v0<'a, R>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError>
-where
-    R: LocalReadAsync,
-{
-    let discrim = socket.read_u8().await?;
-    match discrim {
-        0 => read_set_packet(socket).await,
-        1 => read_get_packet(socket).await,
-        2 => read_watch_packet(socket).await,
-        3 => read_release_packet(socket).await,
-        4 => read_delete_packet(socket).await,
-        5 => read_notify_packet(socket).await,
-        6 => read_getreturn_packet(socket).await,
-        x => Err(NetworkError::UnrecognizedPacketTypeDiscriminator(x)),
+    }
+    async fn serialize<W: LocalWriteAsync>(&self, socket: &mut W) -> Result<(), Self::E> {
+        match self {
+            PacketPayload::Get { key } => write_get_packet(key, socket).await,
+            PacketPayload::Insert { key, value } => write_insert_packet(key, value, socket).await,
+            PacketPayload::Release { key } => write_release_packet(key, socket).await,
+            PacketPayload::Watch {
+                key,
+                activity,
+                behaviour,
+            } => write_watch_packet(key, activity, behaviour, socket).await,
+            PacketPayload::Delete { key } => write_delete_packet(key, socket).await,
+            PacketPayload::Notify { key, value, more } => write_notify_packet(key, value.as_deref(), *more, socket).await,
+            PacketPayload::Return { key, value } => write_getreturn_packet(key, value.as_deref(), socket).await,
+        }
     }
 }
+
+
 
 async fn write_getreturn_packet<'a, W>(
     key: &Key,
@@ -109,24 +108,6 @@ where
 
 
 
-impl OverseerSerde<bool> for bool {
-    type E = std::io::Error;
-    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<bool, Self::E> {
-        Ok(match reader.read_u8().await? {
-            0 => false,
-            1 => true,
-            _ => Err(std::io::Error::new(ErrorKind::InvalidData, "Could not decode boolean."))?,
-        })
-    }
-    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
-        if *self {
-            writer.write_all(vec![  1 ]).await?;
-        } else {
-            writer.write_all(vec![ 0 ]).await?;
-        }
-        Ok(())
-    }
-}
 
 
 
@@ -338,6 +319,26 @@ pub trait OverseerSerde<O: Sized>: Sized {
     async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<O, Self::E>;
 }
 
+impl OverseerSerde<bool> for bool {
+    type E = std::io::Error;
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<bool, Self::E> {
+        Ok(match reader.read_u8().await? {
+            0 => false,
+            1 => true,
+            _ => Err(std::io::Error::new(ErrorKind::InvalidData, "Could not decode boolean."))?,
+        })
+    }
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        if *self {
+            writer.write_all(vec![  1 ]).await?;
+        } else {
+            writer.write_all(vec![ 0 ]).await?;
+        }
+        Ok(())
+    }
+}
+
+
 impl OverseerSerde<Value> for Value {
     type E = NetworkError;
     async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<Value, Self::E> {
@@ -449,10 +450,7 @@ mod tests {
     use crate::{
         access::{WatcherActivity, WatcherBehaviour},
         models::{Key, LocalWriteAsync, Value},
-        network::{decoder::{
-            read_packet,
-            write_packet,
-        }, OverseerSerde, OvrInteger, PacketId, PacketPayload},
+        network::{OverseerSerde, OvrInteger, PacketId, PacketPayload},
     };
 
     use super::Packet;
@@ -521,10 +519,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        packet.write(&mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Notify { key, value, more } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Notify { key, value, more } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
             assert!(value.is_none());
             assert!(!more);
@@ -540,10 +538,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        packet.write(&mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Delete { key } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Delete { key } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
         } else {
             panic!("Wrong packet type.");
@@ -557,10 +555,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        packet.write(&mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Release { key } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Release { key } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
         } else {
             panic!("Wrong packet type.");
@@ -578,14 +576,14 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(&packet, &mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
         if let PacketPayload::Watch {
             key,
             activity,
             behaviour,
-        } = read_packet(&mut cursor).await.unwrap().payload()
+        } = Packet::deserialize(&mut cursor).await.unwrap().payload()
         {
             assert_eq!(key.as_str(), "hello");
             assert_eq!(*activity, WatcherActivity::Lazy);
@@ -604,10 +602,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(&packet, &mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Insert { key, value } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Insert { key, value } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
             assert_eq!(value.as_string().unwrap(), "hello world");
         } else {
@@ -623,10 +621,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(&packet, &mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Insert { key, value } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Insert { key, value } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
             assert_eq!(value.as_integer().unwrap(), 32);
         } else {
@@ -641,10 +639,10 @@ mod tests {
 
         // Write the packet.
         let mut cursor = Cursor::new(vec![]);
-        write_packet(&packet, &mut cursor).await.unwrap();
+        packet.serialize(&mut cursor).await.unwrap();
         cursor.set_position(0);
 
-        if let PacketPayload::Get { key } = read_packet(&mut cursor).await.unwrap().payload() {
+        if let PacketPayload::Get { key } = Packet::deserialize(&mut cursor).await.unwrap().payload() {
             assert_eq!(key.as_str(), "hello");
         } else {
             panic!("Wrong packet type.");
@@ -658,7 +656,7 @@ mod tests {
         OvrInteger::write(skey.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(skey.as_bytes());
 
-        if let PacketPayload::Release { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
+        if let PacketPayload::Release { key } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload() {
             assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
@@ -682,7 +680,7 @@ mod tests {
         // buffer.extend_from_slice(&vec![1, 1].into_iter().chain(Ov).chain(vec![1]).collect::<Vec<u8>>());
 
         if let PacketPayload::Notify { key, value, more } =
-            Packet::read(&mut Cursor::new(buffer)).await.unwrap().payload()
+            Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
             assert_eq!(**key, Key::from_str(skey));
             assert_eq!(**value.as_ref().unwrap(), Value::Integer(64));
@@ -706,7 +704,7 @@ mod tests {
             key,
             activity,
             behaviour,
-        } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
+        } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
             assert_eq!(**key, Key::from_str(skey));
             assert_eq!(*activity, WatcherActivity::Lazy);
@@ -725,7 +723,7 @@ mod tests {
 
         println!("Hello");
 
-        if let PacketPayload::Delete { key } = Packet::read(&mut Cursor::new(buffer)).await.unwrap().payload() {
+        if let PacketPayload::Delete { key } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload() {
             assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
@@ -740,7 +738,7 @@ mod tests {
         // buffer.extend_from_slice(&(skey.as_bytes().len() as u32).to_be_bytes());
         buffer.extend_from_slice(skey.as_bytes());
 
-        if let PacketPayload::Get { key } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload() {
+        if let PacketPayload::Get { key } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload() {
             assert_eq!(**key, Key::from_str(skey));
         } else {
             panic!("Packet did not decode as the proper type.");
@@ -759,7 +757,7 @@ mod tests {
         OvrInteger::write(382i64, &mut buffer).await.unwrap();
         // buffer.extend_from_slice(&svalue.to_be_bytes());
 
-        if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
+        if let PacketPayload::Insert { key, value } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
             assert_eq!(**key, Key::from_str(skey));
             assert_eq!(value.as_integer().unwrap(), 382);
@@ -780,7 +778,7 @@ mod tests {
         OvrInteger::write(svalue.as_bytes().len(), &mut buffer).await.unwrap();
         buffer.extend_from_slice(svalue.as_bytes());
 
-        if let PacketPayload::Insert { key, value } = read_packet(&mut Cursor::new(buffer)).await.unwrap().payload()
+        if let PacketPayload::Insert { key, value } = Packet::deserialize(&mut Cursor::new(buffer)).await.unwrap().payload()
         {
             assert_eq!(**key, Key::from_str(skey));
             assert_eq!(value.as_string().unwrap(), svalue);

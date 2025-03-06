@@ -1,7 +1,7 @@
 use std::{borrow::Borrow, net::{SocketAddr, ToSocketAddrs}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc}};
 
 use dashmap::DashMap;
-use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}, network::{Packet, PacketId, PacketPayload}};
+use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, Value}, network::{OverseerSerde, Packet, PacketId, PacketPayload}};
 use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpStream}, sync::{oneshot::Sender, Mutex, Notify}};
 
 use tokio::io::AsyncWriteExt;
@@ -53,7 +53,7 @@ async fn run_client_backend(mut read: OwnedReadHalf, kill: Arc<Notify>, inner: A
     loop {
 
         let packet = tokio::select! {
-            e = Packet::read(&mut read) => {
+            e = Packet::deserialize(&mut read) => {
                 e
             },
             _ = kill.notified() => {
@@ -65,7 +65,7 @@ async fn run_client_backend(mut read: OwnedReadHalf, kill: Arc<Notify>, inner: A
  
         if packet_id.id() == 0 {
             if let PacketPayload::Notify { key, value, .. } = packet.payload() {
-                let live_value = &*inner.watched.get(key).unwrap().value;
+                let live_value = &*inner.watched.get(&key).unwrap().value;
                 *live_value.value.lock().await = value.as_deref().cloned();
                 live_value.notify.notify_waiters();
             }
@@ -133,7 +133,7 @@ impl Client {
         
         self.inner.channels.insert(packet.id().id(), sdr);
 
-        packet.write(stream).await?;
+        packet.serialize(stream).await?;
         Ok(rcv.await.unwrap())
         // Ok(Packet::read(stream).await?)
     }

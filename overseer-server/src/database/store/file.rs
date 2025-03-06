@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{fmt::UpperHex, path::Path};
 
 use monoio::fs::{File, OpenOptions};
 use overseer::error::NetworkError;
@@ -318,6 +318,21 @@ impl Page {
     }
     pub async fn view(&self, file: &PagedFile) -> Result<[u8; PAGE_SIZE], NetworkError> {
         Ok(self.raw_read(file, 0, PAGE_SIZE as u32).await?.try_into().unwrap())
+    }
+    pub async fn hexdump(&self, file: &PagedFile) -> Result<String, NetworkError> {
+        const WIDTH: usize = 8;
+        let view = self.view(file).await?;
+
+        let rows = view.len() / WIDTH;
+        for y in 0..rows {
+            print!("{:04x}\t", (y as u16 * WIDTH as u16) as u16);
+            for x in 0..WIDTH {
+                
+                print!("{:02x} ", view[y * WIDTH + x]);
+            }
+            println!("");
+        }
+        Ok(String::new())
     }
     pub fn end(&self) -> RawPageAddress {
         self.start.offset(self.size)

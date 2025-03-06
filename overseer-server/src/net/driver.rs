@@ -1,7 +1,7 @@
 use std::{net::ToSocketAddrs, path::Path, rc::Rc, sync::Arc};
 
 use dashmap::DashMap;
-use overseer::{error::NetworkError, models::Key, network::{Packet, PacketId, PacketPayload}};
+use overseer::{error::NetworkError, models::Key, network::{OverseerSerde, Packet, PacketId, PacketPayload}};
 use tokio::{net::{tcp::{OwnedReadHalf, OwnedWriteHalf}, TcpListener, TcpStream}, sync::mpsc::{Receiver, Sender}};
 
 
@@ -94,7 +94,7 @@ async fn handle_client_write(
 ) -> Result<(), NetworkError> {
     loop {
         let packet = receiver.recv().await.unwrap();
-        packet.write(&mut socket).await?;
+        packet.serialize(&mut socket).await?;
     }
 }
 
@@ -104,7 +104,7 @@ async fn handle_client_read(
     ctx: Rc<ClientContext>,
 ) -> Result<(), NetworkError> {
     loop {
-        let packet = Packet::read(&mut socket).await?;
+        let packet = Packet::deserialize(&mut socket).await?;
         let packet_id = packet.id();
         match packet.into_payload() {
             PacketPayload::Insert { key, value } => {

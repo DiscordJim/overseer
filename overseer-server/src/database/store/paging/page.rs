@@ -1,4 +1,7 @@
-use overseer::{error::NetworkError, models::Value};
+use std::io::Cursor;
+
+use overseer::{error::NetworkError, models::Value, network::OverseerSerde};
+
 
 use crate::database::store::file::{Page, PagedFile, PAGE_SIZE};
 
@@ -13,9 +16,17 @@ pub struct Record {
 }
 
 
-impl Record {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        [1,2,3].to_vec()
+impl OverseerSerde<Record> for Record {
+    type E = NetworkError;
+    async fn deserialize<R: overseer::models::LocalReadAsync>(reader: &mut R) -> Result<Record, Self::E> {
+        let val = Option::<&Value>::deserialize(reader).await?;
+        Ok(Self {
+            value: val
+        })
+    }
+    async fn serialize<W: overseer::models::LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        self.value.as_ref().serialize(writer).await?;
+        Ok(())
     }
 }
 
@@ -53,13 +64,16 @@ impl LeafPage {
 
         
 
+        let mut cursor = Cursor::new(vec![]);
+        record.serialize(&mut cursor).await?;
+        let cursor = cursor.into_inner();
 
-        let record_bytes = record.to_bytes().to_vec();
+   
 
         let record_ptr;
         if new_cell_count == 1 {
             // first record in the page.
-            record_ptr = self.inner.capacity() - record_bytes.len() as u32;
+            record_ptr = self.inner.capacity() - cursor.len() as u32;
 
         
 
@@ -69,11 +83,11 @@ impl LeafPage {
             // Get the previous record offset.
             let record = self.get_offset((new_cell_count - 2) as u32, file).await?;
 
-            record_ptr = record as u32 - record_bytes.len() as u32;
+            record_ptr = record as u32 - cursor.len() as u32;
         }
 
         // Write the record.
-        self.inner.write(file, record_ptr, record_bytes).await?;
+        self.inner.write(file, record_ptr, cursor).await?;
 
         // Calculate the offset.
         let offset = 2 + (new_cell_count - 1) * 2;
@@ -119,6 +133,9 @@ mod tests {
         let leaf = LeafPage::new(paged.new_page().await.unwrap());
         leaf.write_record(Record { value: Some(Value::Integer(32)) }, &paged).await.unwrap();
         leaf.write_record(Record { value: Some(Value::Integer(21)) }, &paged).await.unwrap();
+        leaf.write_record(Record { value: Some(Value::String("hello andrew".to_string())) }, &paged).await.unwrap();
+
+        panic!("LEAF: {:?}", leaf.inner.hexdump(&paged).await.unwrap());
 
         assert_eq!(leaf.get_cell_count(&paged).await.unwrap(), 2);
     }

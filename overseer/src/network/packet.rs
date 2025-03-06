@@ -4,7 +4,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, LocalReadAsync, Value}};
 
-use super::decoder::{read_packet, write_packet};
+
 
 pub const CURRENT_VERSION: u8 = 0;
 
@@ -51,18 +51,7 @@ impl<'a> Packet<'a> {
     pub fn into_payload(self) -> PacketPayload<'a> {
         self.payload
     }
-    pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
-    where 
-        W: AsyncWrite + Unpin
-    {
-        write_packet(self, writer).await
-    }
-    pub async fn read<R>(reader: &mut R) -> Result<Packet<'static>, NetworkError>
-    where
-        R: LocalReadAsync
-    {
-        read_packet(reader).await
-    }
+
     pub fn get(id: PacketId, key: &'a Key) -> Self
     {
         Self {

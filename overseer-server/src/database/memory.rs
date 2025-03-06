@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use monoio::io::{as_fd::AsWriteFd, AsyncWriteRent, AsyncWriteRentExt};
 use overseer::{access::{WatcherActivity, WatcherBehaviour}, error::NetworkError, models::{Key, LocalReadAsync, Value}};
 
+use overseer::network::OverseerSerde;
 use crate::net::ClientId;
 
 use super::watcher::{WatchClient, WatchServer, Watcher};
@@ -32,14 +33,15 @@ impl Record {
     where 
         W: tokio::io::AsyncWrite + Unpin
     {
-        self.value().write(writer).await
+        self.value().serialize(writer).await?;
+        Ok(())
     }
     pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
     where 
         R: LocalReadAsync
     {
         Ok(Self {
-            value: Rc::new(Value::read(reader).await?)
+            value: Rc::new(Value::deserialize(reader).await?)
         })
     }
     pub fn value(&self) -> &Rc<Value> {
