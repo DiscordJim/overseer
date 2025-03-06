@@ -3,7 +3,7 @@ use std::{fmt::UpperHex, io, path::Path};
 use monoio::fs::{File, OpenOptions};
 use overseer::{error::NetworkError, models::{asynctrait, IoBufferMut, LocalReadAsync}};
 
-use super::paging::meta::{PageType, RawPageAddress};
+use super::paging::{meta::{PageType, RawPageAddress}, page::{Page, PageReference}};
 
 
 
@@ -61,8 +61,8 @@ impl PagedFile {
         
         if !object.is_initialized {
             // Initialize the database.
-            object.reserve(RawPageAddress::zero(), RESERVED_HEADER_SIZE, RawPageAddress::zero()).await?;
-            format_pagefile_header(&object, &mut object.header_page()).await?;
+            let mut page = object.reserve(RawPageAddress::zero(), RESERVED_HEADER_SIZE, None).await?;
+            format_pagefile_header(&object, &mut page).await?;
 
             object.is_initialized = true;
         } else {
@@ -80,6 +80,9 @@ impl PagedFile {
         
 
     }
+    pub fn add_to_free_list(&mut self, addr: RawPageAddress) {
+        self.free_list.push(addr)
+    }
     pub fn reader(&self, position: usize) -> PagedFileRw<'_> {
         PagedFileRw {
             position,
@@ -89,15 +92,17 @@ impl PagedFile {
     pub fn handle(&self) -> &File {
         &self.underlying
     }
-    fn header_page(&self) -> Page {
-        Page {
-            // file: self,
-            size: RESERVED_HEADER_SIZE,
-            start: RawPageAddress::new(0),
-            free: true,
-            next: RawPageAddress::zero(),
-            previous: RawPageAddress::zero()
-        }
+    fn header_page(&self) -> PageReference {
+        PageReference::new(RawPageAddress::zero(), RESERVED_HEADER_SIZE)
+        // Page {
+        //     // file: self,
+        //     reference:
+        //     size: RESERVED_HEADER_SIZE,
+        //     start: RawPageAddress::new(0),
+        //     free: true,
+        //     next: RawPageAddress::zero(),
+        //     previous: RawPageAddress::zero()
+        // }
     }
     fn pages(&self) -> u32 {
         if !self.is_initialized {
@@ -109,11 +114,15 @@ impl PagedFile {
     pub fn free_pages(&self) -> usize {
         self.free_list.len()
     }
-    async fn acquire(&self, page: u32) -> Result<Page, NetworkError> {
+    pub async fn acquire(&self, page: u32) -> Result<Page, NetworkError> {
         if page >= self.pages() {
             Err(NetworkError::PageOutOfBounds)?;
         }
-        let acked = load_page(self, RawPageAddress::new((RESERVED_HEADER_SIZE) + ((page) * PAGE_SIZE as u32)), PAGE_SIZE as u32).await?;
+        let addr = RawPageAddress::new((RESERVED_HEADER_SIZE) + ((page) * PAGE_SIZE as u32));
+        let reference = PageReference::new(addr, PAGE_SIZE as u32);
+        // println!("Reference: {:#?}", reference);
+
+        let acked = reference.load(self).await?;
         if acked.free {
             return Err(NetworkError::PageFreedError);
         }
@@ -123,30 +132,33 @@ impl PagedFile {
     {
         if self.free_list.is_empty() {
             // If the free list is empty we have to make a new page from scratch.
-            self.reserve(RawPageAddress::new((RESERVED_HEADER_SIZE + (self.pages() * (PAGE_SIZE as u32))) as u32), PAGE_SIZE as u32, RawPageAddress::zero()).await
+            // println!("FOCA");
+            self.reserve(RawPageAddress::new((RESERVED_HEADER_SIZE + (self.pages() * (PAGE_SIZE as u32))) as u32), PAGE_SIZE as u32, None).await
         } else {
             // Let us reuse a page.
+            // println!("FOCB");
             let to_use = self.free_list.pop().unwrap();
-            self.reserve(to_use, PAGE_SIZE as u32, RawPageAddress::zero()).await
+            self.reserve(to_use, PAGE_SIZE as u32, None).await
         }
         
     }
-    async fn reserve<'a>(&'a mut self, ptr: RawPageAddress, size: u32, previous: RawPageAddress) -> Result<Page, NetworkError> {
+    async fn reserve<'a>(&'a mut self, ptr: RawPageAddress, size: u32, previous: Option<RawPageAddress>) -> Result<Page, NetworkError> {
         if self.pages() == 0 {
             self.file_size += size as u64;
-            println!()
+            // println!()
         } else if self.pages() > 0 && (ptr.as_u64() as u32 - RESERVED_HEADER_SIZE) / PAGE_SIZE as u32 >= self.pages() {
             self.file_size += size as u64;
         }
-        let mut page = Page {
-            // file: self,
-            start: ptr,
-            size,
-            free: false,
-            previous,
-            next: RawPageAddress::zero()
-        };
-        format_page(&self, &mut page).await?;
+
+        // println!("Performing reserve. {:?}", previous);
+        let reference = PageReference::new(ptr, size);
+        let mut page = reference.load_formatted(self).await?;
+        if let Some(previous) = previous {
+            page.set_previous(self, previous.page_number()).await?;
+        }
+        
+        // println!("Performing reserve2. {:?}", page);
+
         
         Ok(page)
     }
@@ -156,20 +168,6 @@ impl PagedFile {
     }
 }
 
-
-
-#[derive(Debug)]
-pub struct Page {
-    start: RawPageAddress,
-    size: u32,
-    free: bool,
-    previous: RawPageAddress,
-    next: RawPageAddress
-}
-
-
-
-
 async fn format_pagefile_header(file: &PagedFile, page: &Page) -> Result<(), NetworkError>
 {
     page.raw_write(file, 0, vec![MAGIC_BYTE, 0, 0, 0]).await.unwrap();
@@ -178,153 +176,6 @@ async fn format_pagefile_header(file: &PagedFile, page: &Page) -> Result<(), Net
     Ok(())
 }
 
-async fn load_page(file: &PagedFile, ptr: RawPageAddress, size: u32) -> Result<Page, NetworkError>
-{
-    let (r, e) = file.underlying.read_exact_at(vec![0u8; 5], ptr.as_u64()).await;
-    r?;
-    let is_free = e[0] == 1;
-    let previous_page = RawPageAddress::new(u32::from_le_bytes(e[1..5].try_into().unwrap()) * (PAGE_SIZE as u32) + (RESERVED_HEADER_SIZE as u32));
-    
-    let (r, e) = file.underlying.read_exact_at(vec![0u8; 4], ptr.offset(5).as_u64()).await;
-    r?;
-    let next_page = RawPageAddress::new(u32::from_le_bytes(e[0..4].try_into().unwrap()) * (PAGE_SIZE as u32) + (RESERVED_HEADER_SIZE as u32));
-    
-
-
-
-    Ok(Page {
-        // file,
-        start: ptr,
-        size,
-        free: is_free,
-        next: next_page,
-        previous: previous_page
-    })
-}
-
-async fn format_page(file: &PagedFile, page: &mut Page) -> Result<(), NetworkError>
-{
-    // Zero the page.
-    page.raw_write(file, 0, vec![0u8; page.size as usize]).await?;
-
-    // Write the free byte. (we are obviously free)
-    // page.write(file, 0, vec![0u8, 0u8, 0u8, 0u8, 0u8, 0u8]).await?;
-
-    page.next = RawPageAddress::zero();
-    page.previous = RawPageAddress::zero();
-    
-    Ok(())
-}
-
-impl Page {
-    pub fn get_write_ptr(&self, position: u32) -> RawPageAddress {
-        self.start.offset(position).offset(PAGE_HEADER_RESERVED_BYTES as u32)
-    }
-    fn bound_check(&self, position: u32, size: u32) -> Result<(), NetworkError> {
-        if (position + size) > self.size {
-            return Err(NetworkError::IllegalRead)?;
-        }
-        Ok(())
-    }
-    async fn raw_read(&self, file: &PagedFile, position: u32, size: u32) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position, size)?;
-        let (r, buf) = file.underlying.read_exact_at(Vec::with_capacity(size as usize), self.start.offset(position).as_u64()).await;
-        r?;
-        Ok(buf)
-    }
-    pub async fn read(&self, file: &PagedFile, position: u32, size: u32) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, size)?;
-        let (r, buf) = file.underlying.read_exact_at(Vec::with_capacity(size as usize), self.get_write_ptr(position).as_u64()).await;
-        r?;
-        Ok(buf)
-    }
-    async fn raw_write(&self, file: &PagedFile, position: u32, bytes: Vec<u8>) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position, bytes.len() as u32)?;
-        let (r, buf) = file.underlying.write_all_at(bytes, self.start.offset(position as u32).as_u64()).await;
-        r?;
-        Ok(buf)
-    }
-    
-    pub async fn write(&self, file: &PagedFile, position: u32, bytes: Vec<u8>) -> Result<Vec<u8>, NetworkError> {
-        self.bound_check(position + PAGE_HEADER_RESERVED_BYTES, bytes.len() as u32)?;
-        let (r, buf) = file.underlying.write_all_at(bytes, self.get_write_ptr(position).as_u64()).await;
-        r?;
-        Ok(buf)
-    }
-    pub async fn free(&mut self, file: &mut PagedFile) -> Result<(), NetworkError> {
-        self.raw_write(file, 0, vec![1u8]).await?;
-        self.free = true;
-        file.free_list.push(self.start);
-        Ok(())
-    }
-    pub async fn get_type(&self, file: &mut PagedFile) -> Result<PageType, NetworkError> {
-        let ntype = self.raw_read(file, 9, 1).await?[0];
-        PageType::from_u8(ntype)
-    }
-    pub async fn set_type(&self, ptype: PageType, file: &mut PagedFile) -> Result<(), NetworkError> {
-        self.raw_write(file, 9, vec![ptype.as_u8()]).await?;
-        Ok(())
-    }
-    async fn set_previous(&mut self, file: &PagedFile, previous: u32) -> Result<(), NetworkError> {
-        self.raw_write(file, 1, previous.to_le_bytes().to_vec()).await?;
-        self.previous = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE as u32);
-        Ok(())
-    }
-    async fn set_next(&mut self, file: &PagedFile, previous: u32) -> Result<(), NetworkError> {
-        self.raw_write(file, 5, previous.to_le_bytes().to_vec()).await?;
-        self.next = RawPageAddress::new(RESERVED_HEADER_SIZE + previous * PAGE_SIZE as u32);
-        Ok(())
-    }
-    /// Checks if this page has a next.
-    pub fn has_next(&self) -> bool {
-        !self.next.is_zero()
-    }
-    pub fn size(&self) -> u32 {
-        self.size
-    }
-    /// This will allocate a new page if we do not have a next page.
-    pub async fn get_next(&mut self, file: &mut PagedFile) -> Result<Page, NetworkError> {
-        if self.has_next() {
-            // // We already have a page.
-            Ok(file.acquire(self.next.page_number()).await?)
-        } else {
-            
-            let mut o: Page = file.new_page().await?;
-            o.set_previous(file, self.start.page_number()).await?;
-            self.set_next(file, o.start.page_number()).await?;
-            Ok(o)
-        }
-    }
-    pub fn full_size(&self) -> u32 {
-        self.size
-    }
-    pub fn capacity(&self) -> u32 {
-        self.full_size() - PAGE_HEADER_RESERVED_BYTES 
-    }
-    pub async fn view(&self, file: &PagedFile) -> Result<[u8; PAGE_SIZE], NetworkError> {
-        Ok(self.raw_read(file, 0, PAGE_SIZE as u32).await?.try_into().unwrap())
-    }
-    pub async fn hexdump(&self, file: &PagedFile) -> Result<String, NetworkError> {
-        const WIDTH: usize = 8;
-        let view = self.view(file).await?;
-
-        let rows = view.len() / WIDTH;
-        for y in 0..rows {
-            print!("{:04x}\t", (y as u16 * WIDTH as u16) as u16);
-            for x in 0..WIDTH {
-                
-                print!("{:02x} ", view[y * WIDTH + x]);
-            }
-            println!("");
-        }
-        Ok(String::new())
-    }
-    pub fn end(&self) -> RawPageAddress {
-        self.start.offset(self.size)
-    }
-
-    
-}
 
 
 #[cfg(test)]
@@ -406,14 +257,15 @@ mod tests {
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
         let mut page = paged.new_page().await.unwrap();
 
-        assert_eq!(page.start.page_number(), 0);
+        assert_eq!(page.start().page_number(), 0);
         assert!(!page.has_next());
+        println!("Page previous: {:?}", page.previous);
         assert!(page.previous.is_zero());
 
         let chain = page.get_next(&mut paged).await.unwrap();
         assert!(page.previous.is_zero());
         assert!(page.has_next());
-        assert_eq!(page.get_next(&mut paged).await.unwrap().start.page_number(), chain.start.page_number());
+        assert_eq!(page.get_next(&mut paged).await.unwrap().start().page_number(), chain.start().page_number());
         assert_eq!(chain.previous.page_number(), 0);
         assert_eq!(page.next.page_number(), 1);
 

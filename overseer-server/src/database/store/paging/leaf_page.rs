@@ -3,7 +3,9 @@ use std::io::Cursor;
 use overseer::{error::NetworkError, models::Value, network::OverseerSerde};
 
 
-use crate::database::store::file::{Page, PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE, RESERVED_HEADER_SIZE};
+use crate::database::store::file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE};
+
+use super::page::Page;
 
 
 /// The format of the leaf page starts with a cell count (2-byte)
@@ -81,7 +83,7 @@ impl LeafPage {
         } else {
             // The count + Offsets + the last offset.
             let total_used = 2 + 2 * count as u32;
-            let final_offset = self.inner.full_size() - self.get_offset((count - 1) as u32, paged).await? as u32 - PAGE_HEADER_RESERVED_BYTES;
+            let final_offset = self.inner.size() - self.get_offset((count - 1) as u32, paged).await? as u32 - PAGE_HEADER_RESERVED_BYTES;
             Ok(self.inner.capacity() - (total_used + final_offset))
         }
     }

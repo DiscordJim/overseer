@@ -1,3 +1,5 @@
+use overseer::error::NetworkError;
+
 use crate::database::store::file::{PAGE_SIZE, RESERVED_HEADER_SIZE};
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
