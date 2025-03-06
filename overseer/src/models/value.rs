@@ -3,9 +3,9 @@ use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{error::{NetworkError, ValueParseError}, network::decoder::{read_value, write_value}};
+use crate::{error::{NetworkError, ValueParseError}};
 
-use super::LocalReadAsync;
+use super::{LocalReadAsync, LocalWriteAsync};
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Value {
@@ -15,18 +15,8 @@ pub enum Value {
 
 
 impl Value {
-    pub async fn write<W>(&self, writer: &mut W) -> Result<(), NetworkError>
-    where 
-        W: AsyncWrite + Unpin
-    {
-        write_value(&Cow::Borrowed(self), writer).await
-    }
-    pub async fn read<R>(reader: &mut R) -> Result<Self, NetworkError>
-    where 
-        R: LocalReadAsync
-    {
-        read_value(reader).await
-    }
+
+
     // pub fn from_discriminator(id: u8, bytes: &[u8]) -> Result<Self, NetworkError> {
     //     Ok(match id {
     //         0 => S

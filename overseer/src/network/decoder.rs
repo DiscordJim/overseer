@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, io::ErrorKind};
 
 
 
@@ -9,6 +9,8 @@ use crate::{
 };
 
 use super::{OvrInteger, Packet, PacketId, PacketPayload, CURRENT_VERSION};
+
+
 
 
 // Encoder
@@ -85,8 +87,8 @@ async fn write_getreturn_packet<'a, W>(
 where
     W: LocalWriteAsync,
 {
-    write_key(key, socket).await?;
-    write_optional_value(val, socket).await?;
+    key.serialize(socket).await?;
+    val.serialize(socket).await?;
     Ok(())
 }
 
@@ -99,61 +101,61 @@ async fn write_notify_packet<'a, W>(
 where
     W: LocalWriteAsync,
 {
-    write_key(&key, socket).await?;
-    write_optional_value(value, socket).await?;
-    write_bool(more, socket).await?;
+    key.serialize(socket).await?;
+    value.serialize(socket).await?;
+    more.serialize(socket).await?;
     Ok(())
 }
 
-async fn write_bool<W>(val: bool, writer: &mut W) -> Result<(), NetworkError>
-where
-    W: LocalWriteAsync,
-{
-    if val {
-        writer.write_all(vec![  1 ]).await?;
-    } else {
-        writer.write_all(vec![ 0 ]).await?;
+
+
+impl OverseerSerde<bool> for bool {
+    type E = std::io::Error;
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<bool, Self::E> {
+        Ok(match reader.read_u8().await? {
+            0 => false,
+            1 => true,
+            _ => Err(std::io::Error::new(ErrorKind::InvalidData, "Could not decode boolean."))?,
+        })
     }
-    Ok(())
-}
-
-async fn read_bool<R>(reader: &mut R) -> Result<bool, NetworkError>
-where
-    R: LocalReadAsync
-{
-    Ok(match reader.read_u8().await? {
-        0 => false,
-        1 => true,
-        _ => Err(NetworkError::ErrorDecodingBoolean)?,
-    })
-}
-
-async fn write_optional_value<'a, W>(val: Option<&'a Value>, writer: &mut W) -> Result<(), NetworkError>
-where
-    W: LocalWriteAsync,
-{
-    match val {
-        Some(v) => {
-            writer.write_all(vec![ 1 ]).await?;
-            write_value(&v, writer).await?;
-        }
-        None => {
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        if *self {
+            writer.write_all(vec![  1 ]).await?;
+        } else {
             writer.write_all(vec![ 0 ]).await?;
         }
+        Ok(())
     }
-    Ok(())
 }
 
-async fn read_optional_value<R>(reader: &mut R) -> Result<Option<Value>, NetworkError>
-where
-    R: LocalReadAsync,
-{
-    Ok(match reader.read_u8().await? {
-        0 => None,
-        1 => Some(read_value(reader).await?),
-        _ => Err(NetworkError::ErrorDecodingOption)?,
-    })
-}
+
+
+// async fn write_optional_value<'a, W>(val: Option<&'a Value>, writer: &mut W) -> Result<(), NetworkError>
+// where
+//     W: LocalWriteAsync,
+// {
+//     match val {
+//         Some(v) => {
+//             writer.write_all(vec![ 1 ]).await?;
+//             v.serialize(writer).await?;
+//         }
+//         None => {
+//             writer.write_all(vec![ 0 ]).await?;
+//         }
+//     }
+//     Ok(())
+// }
+
+// async fn read_optional_value<R>(reader: &mut R) -> Result<Option<Value>, NetworkError>
+// where
+//     R: LocalReadAsync,
+// {
+//     Ok(match reader.read_u8().await? {
+//         0 => None,
+//         1 => Some(Value::deserialize(reader).await?),
+//         _ => Err(NetworkError::ErrorDecodingOption)?,
+//     })
+// }
 
 async fn write_watch_packet<W: LocalWriteAsync>(
     key: &Key,
@@ -161,7 +163,7 @@ async fn write_watch_packet<W: LocalWriteAsync>(
     behaviour: &WatcherBehaviour,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    write_key(&key, socket).await?;
+    key.serialize(socket).await?;
     socket
         .write_all([activity.discriminator(), behaviour.discriminator()].to_vec())
         .await?;
@@ -173,20 +175,20 @@ async fn write_insert_packet<'a, W: LocalWriteAsync>(
     value: &'a Cow<'a, Value>,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    write_key(&key, socket).await?;
-    write_value(&**value, socket).await?;
+    key.serialize(socket).await?;
+    value.serialize(socket).await?;
     Ok(())
 }
 
-pub(crate) async fn write_value<'a, W: LocalWriteAsync>(
-    value: &'a Value,
-    socket: &mut W,
-) -> Result<(), NetworkError> {
-    match &*value {
-        Value::String(s) => write_value_string(&*s, socket).await,
-        Value::Integer(s) => write_value_signed_integer(*s, socket).await,
-    }
-}
+// pub(crate) async fn write_value<'a, W: LocalWriteAsync>(
+//     value: &'a Value,
+//     socket: &mut W,
+// ) -> Result<(), NetworkError> {
+//     match &*value {
+//         Value::String(s) => write_value_string(&*s, socket).await,
+//         Value::Integer(s) => write_value_signed_integer(*s, socket).await,
+//     }
+// }
 
 #[inline]
 async fn write_value_string<'a, W: LocalWriteAsync>(
@@ -194,19 +196,18 @@ async fn write_value_string<'a, W: LocalWriteAsync>(
     socket: &mut W,
 ) -> Result<(), NetworkError> {
     socket.write_all(vec![ 0 ]).await?;
-    write_string(value, socket).await?;
+    value.serialize(socket).await?;
     Ok(())
 }
 
-#[inline]
-async fn write_string<'a, W: LocalWriteAsync>(
-    value: &'a str,
-    socket: &mut W,
-) -> Result<(), NetworkError> {
-    OvrInteger::write(value.len(), socket).await?;
-    socket.write_all(value.as_bytes().to_vec()).await?;
-    Ok(())
-}
+// #[inline]
+// async fn write_string<'a, W: LocalWriteAsync>(
+//     value: &'a str,
+//     socket: &mut W,
+// ) -> Result<(), NetworkError> {
+    
+//     Ok(())
+// }
 
 async fn write_value_signed_integer<W: LocalWriteAsync>(
     value: i64,
@@ -222,7 +223,7 @@ async fn write_delete_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    write_key(&key, socket).await?;
+    key.serialize(socket).await?;
     Ok(())
 }
 
@@ -230,7 +231,7 @@ async fn write_get_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    write_key(&key, socket).await?;
+    key.serialize(socket).await?;
     Ok(())
 }
 
@@ -238,16 +239,17 @@ async fn write_release_packet<W: LocalWriteAsync>(
     key: &Key,
     socket: &mut W,
 ) -> Result<(), NetworkError> {
-    write_key(&key, socket).await?;
+    key.serialize(socket).await?;
     Ok(())
 }
 
-pub(crate) async fn write_key<'a, W: LocalWriteAsync>(
-    key: &'a Key,
-    socket: &mut W,
-) -> Result<(), NetworkError> {
-   write_string(key.as_str(), socket).await
-}
+// #[inline]
+// pub(crate) async fn write_key<'a, W: LocalWriteAsync>(
+//     key: &'a Key,
+//     socket: &mut W,
+// ) -> Result<(), NetworkError> {
+//    write_string(key.as_str(), socket).await
+// }
 
 // Decoder
 
@@ -255,47 +257,47 @@ pub(crate) async fn write_key<'a, W: LocalWriteAsync>(
 async fn read_getreturn_packet<'a, R: LocalReadAsync>(
     socket: &mut R,
 ) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
-    let value = read_optional_value(socket).await?;
+    let key = Key::deserialize(socket).await?;
+    let value = Option::<&Value>::deserialize(socket).await?;
     Ok(PacketPayload::Return { key: Cow::Owned(key), value: value.map(|f| Cow::Owned(f)) })
 }
 /// Reads a packet of the set type.
 async fn read_notify_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
-    let value = read_optional_value(socket).await?;
-    let more = read_bool(socket).await?;
+    let key = Key::deserialize(socket).await?;
+    let value = Option::<&Value>::deserialize(socket).await?;
+    let more = bool::deserialize(socket).await?;
     Ok(PacketPayload::Notify { key: Cow::Owned(key), value: value.map(|f| Cow::Owned(f)), more })
 }
 
 /// Reads a packet of the set type.
 async fn read_delete_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
     println!("Reading delete packet...");
-    let key = read_key(socket).await?;
+    let key = Key::deserialize(socket).await?;
     Ok(PacketPayload::Delete { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
 async fn read_release_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
+    let key = Key::deserialize(socket).await?;
     Ok(PacketPayload::Release { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
 async fn read_get_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
+    let key = Key::deserialize(socket).await?;
     Ok(PacketPayload::Get { key: Cow::Owned(key) })
 }
 
 /// Reads a packet of the set type.
 async fn read_set_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
-    let value = read_value(socket).await?;
+    let key = Key::deserialize(socket).await?;
+    let value = Value::deserialize(socket).await?;
     Ok(PacketPayload::Insert { key: Cow::Owned(key), value: Cow::Owned(value) })
 }
 
 /// Reads a packet of the set type.
 async fn read_watch_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<PacketPayload<'a>, NetworkError> {
-    let key = read_key(socket).await?;
+    let key = Key::deserialize(socket).await?;
     let activity = WatcherActivity::try_from(socket.read_u8().await?)?;
     let behaviour = WatcherBehaviour::try_from(socket.read_u8().await?)?;
     Ok(PacketPayload::Watch {
@@ -305,59 +307,152 @@ async fn read_watch_packet<'a, R: LocalReadAsync>(socket: &mut R) -> Result<Pack
     })
 }
 
-pub(crate) async fn read_value<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
-    let type_discrim = socket.read_u8().await?;
-    match type_discrim {
-        0 => decode_value_string(socket).await,
-        1 => decode_value_signed_integer(socket).await,
-        x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x)),
-    }
-}
+
+// pub(crate) async fn read_value<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
+//     let type_discrim = socket.read_u8().await?;
+//     match type_discrim {
+//         0 => Ok(Value::String(<&str>::deserialize(socket).await?)),
+//         1 => decode_value_signed_integer(socket).await,
+//         x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x)),
+//     }
+// }
 
 async fn decode_value_signed_integer<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
     let val: i64 = OvrInteger::read(socket).await?;
     Ok(Value::Integer(val))
 }
 
-async fn decode_value_string<R: LocalReadAsync>(socket: &mut R) -> Result<Value, NetworkError> {
 
-    // Figure out the size of the string.
-    let string_length: u64 = OvrInteger::read(socket).await?;
 
-    if string_length == 0 {
-        return Ok(Value::String("".to_string()));
-    }
+// pub(crate) async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
+// where 
+//     R: LocalReadAsync
+// {
+    
+// }
 
-    let mut str_buf = vec![0u8; string_length as usize];
-    socket.read_exact(&mut str_buf).await?;
-
-    Ok(Value::String(
-        String::from_utf8(str_buf).map_err(|_| NetworkError::FailedToReadValue)?,
-    ))
+#[allow(async_fn_in_trait)]
+pub trait OverseerSerde<O: Sized>: Sized {
+    type E;
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E>;
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<O, Self::E>;
 }
 
-pub(crate) async fn read_key<R>(socket: &mut R) -> Result<Key, NetworkError>
+impl OverseerSerde<Value> for Value {
+    type E = NetworkError;
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<Value, Self::E> {
+        let type_discrim = reader.read_u8().await?;
+        match type_discrim {
+            0 => Ok(Value::String(<&str>::deserialize(reader).await?)),
+            1 => decode_value_signed_integer(reader).await,
+            x => Err(NetworkError::UnrecognizedValueTypeDiscriminator(x)),
+        }
+    }
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        match &*self {
+            Value::String(s) => write_value_string(&*s, writer).await,
+            Value::Integer(s) => write_value_signed_integer(*s, writer).await,
+        }
+    }
+}
+
+impl<'a, J, O> OverseerSerde<Option<O>> for Option<&'a J>
 where 
-    R: LocalReadAsync
+    J: OverseerSerde<O>,
+    O: Sized,
+    <J as OverseerSerde<O>>::E: From<std::io::Error>
 {
-    if let Value::String(inner) = decode_value_string(socket).await? {
-        Ok(Key::from_str(&inner ))
-    } else {
-        Err(NetworkError::FailedToReadKey)
+    type E = J::E;
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<Option<O>, Self::E> {
+        let flag = reader.read_u8().await?;
+        if flag == 0 {
+            Ok(None)
+        } else if flag == 1 {
+            Ok(Some(J::deserialize(reader).await?))
+        } else {
+            Err(std::io::Error::new(ErrorKind::InvalidData, "Failed decoding option"))?
+        }
+    }
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        match self {
+            None => writer.write_u8(0).await?,
+            Some(i) => {
+                writer.write_u8(1).await?;
+                i.serialize(writer).await?;
+            }
+        }
+        Ok(())
+    }
+    
+}
+
+impl<'a> OverseerSerde<String> for &'a str {
+    type E = NetworkError;
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        OvrInteger::write(self.len(), writer).await?;
+        writer.write_all(self.as_bytes().to_vec()).await?;
+        Ok(())
+    }
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<String, Self::E> {
+        // Figure out the size of the string.
+        let string_length: u64 = OvrInteger::read(reader).await?;
+
+        if string_length == 0 {
+            return Ok(String::default());
+        }
+
+        let mut str_buf = vec![0u8; string_length as usize];
+        reader.read_exact(&mut str_buf).await?;
+
+        Ok(
+            String::from_utf8(str_buf).map_err(|_| NetworkError::FailedToReadValue)?,
+        )
     }
 }
+
+impl OverseerSerde<Key> for Key {
+    type E = NetworkError;
+    async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        self.as_str().serialize(writer).await?;
+        Ok(())
+    }
+    async fn deserialize<R: LocalReadAsync>(reader: &mut R) -> Result<Self, Self::E> {
+        Ok(Key::from_owned(<&str>::deserialize(reader).await?))
+    }
+}
+
+// #[async_trait::async_trait]
+// impl OverseerSerde for Key {
+//     type E = NetworkError;
+//     async fn serialize<W: LocalWriteAsync>(&self, writer: &mut W) -> Result<(), E> {
+//         if let Value::String(inner) = decode_value_string(socket).await? {
+//             Ok(Key::from_str(&inner ))
+//         } else {
+//             Err(NetworkError::FailedToReadKey)
+//         }
+//     }
+//     async fn deserialize<W: LocalReadAsync>(writer: &mut W) -> std::io::Result<Key> {
+//         if let Value::String(inner) = decode_value_string(socket).await? {
+//             Ok(Key::from_str(&inner ))
+//         } else {
+//             Err(NetworkError::FailedToReadKey)
+//         }
+//     }
+// }
 
 #[cfg(test)]
 mod tests {
     use std::io::{Cursor, Read, Write};
 
+  
+
     use crate::{
         access::{WatcherActivity, WatcherBehaviour},
         models::{Key, LocalWriteAsync, Value},
         network::{decoder::{
-            read_bool, read_optional_value, read_packet, write_bool, write_optional_value,
+            read_packet,
             write_packet,
-        }, OvrInteger, PacketId, PacketPayload},
+        }, OverseerSerde, OvrInteger, PacketId, PacketPayload},
     };
 
     use super::Packet;
@@ -367,8 +462,8 @@ mod tests {
     #[tokio::test]
     pub async fn read_bool_test() {
         let mut cursor = Cursor::new(vec![0, 1]);
-        assert_eq!(read_bool(&mut cursor).await.unwrap(), false);
-        assert_eq!(read_bool(&mut cursor).await.unwrap(), true);
+        assert_eq!(bool::deserialize(&mut cursor).await.unwrap(), false);
+        assert_eq!(bool::deserialize(&mut cursor).await.unwrap(), true);
     }
 
     #[tokio::test]
@@ -381,9 +476,9 @@ mod tests {
 
 
 
-        assert_eq!(read_optional_value(&mut cursor).await.unwrap(), None);
+        assert_eq!(Option::<&Value>::deserialize(&mut cursor).await.unwrap(), None);
         assert_eq!(
-            read_optional_value(&mut cursor).await.unwrap(),
+            Option::<&Value>::deserialize(&mut cursor).await.unwrap(),
             Some(Value::Integer(64))
         );
     }
@@ -392,15 +487,14 @@ mod tests {
     pub async fn write_optional_value_test() {
         // Write a null.
         let mut cursor = vec![];
-        write_optional_value(None, &mut cursor).await.unwrap();
+        None::<&Value>.serialize(&mut cursor).await.unwrap();
+        // write_optional_value(None, &mut cursor).await.unwrap();
         assert_eq!(cursor.len(), 1);
         assert_eq!(cursor[0], 0);
 
         // Write some value
         let mut cursor = Cursor::new(vec![]);
-        write_optional_value(Some(&Value::Integer(22)), &mut cursor)
-            .await
-            .unwrap();
+        Some(&Value::Integer(22)).serialize(&mut cursor).await.unwrap();
         // assert_eq!(cursor.len(), 3);
         cursor.set_position(2);
         assert_eq!(OvrInteger::read::<i64, _>(&mut cursor).await.unwrap(), 22);
@@ -409,9 +503,9 @@ mod tests {
     #[tokio::test]
     pub async fn write_bool_test() {
         let mut cursor = vec![];
-        write_bool(true, &mut cursor).await.unwrap();
+        true.serialize(&mut cursor).await.unwrap();
         assert_eq!(cursor[0], 1);
-        write_bool(false, &mut cursor).await.unwrap();
+        false.serialize(&mut cursor).await.unwrap();
         assert_eq!(cursor[1], 0);
     }
 

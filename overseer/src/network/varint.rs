@@ -1,20 +1,29 @@
-use std::{io, u64};
+use std::io;
 
-use integer_encoding::{VarInt, VarIntAsyncReader, VarIntReader};
+use integer_encoding::VarInt;
 
-use crate::{error::NetworkError, models::{LocalReadAsync, LocalWriteAsync}};
+use crate::models::{LocalReadAsync, LocalWriteAsync};
 
 
 
 pub struct OvrInteger;
 
 impl OvrInteger {
-    pub async fn write<VI: VarInt, W: LocalWriteAsync>(data: VI, writer: &mut W) -> Result<(), io::Error>{
+    pub async fn write<VI, W>(data: VI, writer: &mut W) -> std::io::Result<()>
+    where 
+        VI: VarInt,
+        W: LocalWriteAsync
+    {
         writer.write_all(data.encode_var_vec()).await?;
         Ok(())
 
     }
-    pub async fn read<VI: VarInt, R: LocalReadAsync>(reader: &mut R) -> Result<VI, io::Error>{
+    /// Reads a variable integer.
+    pub async fn read<VI, R>(reader: &mut R) -> std::io::Result<VI>
+    where 
+        VI: VarInt,
+        R: LocalReadAsync
+    {
         let mut buffer: Vec<u8> = vec![];
         loop {
             let byte = reader.read_u8().await?;
@@ -46,7 +55,7 @@ mod tests {
 
 
     #[tokio::test]
-    pub async fn test_write_var_int_u8() {
+    pub async fn test_write_var_int_basic() {
         let mut cursor = Cursor::new(Vec::<u8>::new());
         OvrInteger::write(0u64, &mut cursor).await.unwrap();
         cursor.set_position(0);
