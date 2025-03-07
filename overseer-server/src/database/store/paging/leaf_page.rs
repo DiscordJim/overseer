@@ -5,13 +5,15 @@ use overseer::{error::NetworkError, models::Value, network::OverseerSerde};
 
 use crate::database::store::file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE};
 
-use super::page::Page;
+use super::page::{Page, Projection, Transact};
 
+
+pub struct Leaf;
 
 /// The format of the leaf page starts with a cell count (2-byte)
-pub struct LeafPage {
-    inner: Page
-}
+// pub struct LeafPage {
+//     inner: Page
+// }
 
 pub struct Record {
     value: Option<Value>
@@ -55,121 +57,131 @@ impl OverseerSerde<Record> for Record {
     }
 }
 
-impl LeafPage {
-    pub fn new(inner: Page) -> Self {
-        Self {
-            inner
-        }
+impl Projection<Leaf> {
+    pub fn get_cell_count(&self) -> u16 {
+        u16::from_le_bytes(self[0..2].try_into().unwrap())
     }
-   
-    pub async fn get_cell_count(&self, file: &PagedFile) -> Result<u16, NetworkError> {
-        let val: [u8; 2] = self.inner.read(file, 0, 2).await?.try_into().unwrap();
-        Ok(u16::from_le_bytes(val))
-    }
-    pub async fn set_cell_count(&self, file: &PagedFile, cells: u16) -> Result<(), NetworkError> {
-        self.inner.write(file, 0, cells.to_le_bytes().to_vec()).await?;
-        Ok(())
+    
+
+    pub fn get_offset(&self, index: u32) -> u16 {
+        let pos = (2 + index * 2) as usize;
+        u16::from_le_bytes(self[pos .. pos + 2].try_into().unwrap())
     }
 
-    pub async fn get_offset(&self, index: u32, file: &PagedFile) -> Result<u16, NetworkError> {
-        let val: [u8; 2] = self.inner.read(file, 2 + index * 2, 2).await?.try_into().unwrap();
-        Ok(u16::from_le_bytes(val))
-    }
-
-    pub async fn get_remaining_space(&self, paged: &PagedFile) -> Result<u32, NetworkError> {
-        let count = self.get_cell_count(paged).await?;
+    pub fn get_remaining_space(&self) -> usize {
+        let count = self.get_cell_count();
         if count == 0 {
-            Ok(self.inner.capacity() - 2)
+            self.capacity() - 2
         } else {
             // The count + Offsets + the last offset.
-            let total_used = 2 + 2 * count as u32;
-            let final_offset = self.inner.size() - self.get_offset((count - 1) as u32, paged).await? as u32 - PAGE_HEADER_RESERVED_BYTES;
-            Ok(self.inner.capacity() - (total_used + final_offset))
+            let total_used = 2 + 2 * count as usize;
+            let final_offset = self.size() - self.get_offset((count - 1) as u32) as usize - PAGE_HEADER_RESERVED_BYTES as usize;
+            self.capacity() - (total_used + final_offset)
         }
     }
     /// Checks if a record will fit into the database.
-    pub async fn will_fit(&self, record: &SerializedRecord, paged: &PagedFile) -> Result<bool, NetworkError> {
-        let remaining = self.get_remaining_space(paged).await?;
-        Ok(record.data.len() + 2 <= remaining as usize)
+    pub fn will_fit(&self, record: &SerializedRecord) -> bool {
+        let remaining = self.get_remaining_space();
+        record.data.len() + 2 <= remaining as usize
     }
     
-    pub async fn read_record(&self, index: u16, paged: &PagedFile) -> Result<Option<Record>, NetworkError>
+    pub async fn read_record(&self, index: u16) -> Result<Option<Record>, NetworkError>
     {
-        if index >= self.get_cell_count(&paged).await? {
+        if index >= self.get_cell_count() {
             return Ok(None);
         } else {
-            let offset = self.get_offset(index as u32, paged).await?;
-            let actual_offset = self.inner.get_write_ptr(offset as u32).as_u64() as usize;
-            let mut page_reader = paged.reader(actual_offset);
-            let record = Record::deserialize(&mut page_reader).await?;
-            // let record = Record::deserialize();
+            // Calculate the record offset.
+            let offset = self.get_offset(index as u32);
+
+            let mut reader = self.reader(offset as usize);
+            let record = Record::deserialize(&mut reader).await?;
+
+            // let offset = self.get_offset(index as u32) + PAGE_HEADER_RESERVED_BYTES as u16;
+            // let mut page_reader = paged.reader(actual_offset);
+            // let record = Record::deserialize(&mut page_reader).await?;
+
             Ok(Some(record))
         }
     }
 
 
-    pub async fn write_record(&self, record: Record, file: &PagedFile) -> Result<(), NetworkError> {
-        self.write_serialized_record(record.produce().await?, file).await
-    }
-    /// Increments and returns the new Cell count.
-    async fn increment_cell_count(&self, file: &PagedFile) -> Result<u16, NetworkError> {
-        let new = self.get_cell_count(file).await? + 1;
-        self.set_cell_count(file, new).await?;
-        Ok(new)
-    }
+    
+    
     /// Finds a new record pointer location in the file. This takes in the new cell count,
     /// which is the cell count including this new record.
-    async fn find_new_record_ptr(&self, cell_count: u16, record: &SerializedRecord, file: &PagedFile) -> Result<u32, NetworkError> {
+    fn find_new_record_ptr(&self, cell_count: u16, record: &SerializedRecord) -> u32 {
         let record_ptr;
         if cell_count == 1 {
             // first record in the page.
-            record_ptr = self.inner.capacity() - record.data.len() as u32;
+            record_ptr = self.capacity() - record.data.len();
 
         } else {
             // Get the previous record offset.
-            let record_offset = self.get_offset((cell_count - 2) as u32, file).await?;
+            let record_offset = self.get_offset((cell_count - 2) as u32);
 
-            record_ptr = record_offset as u32 - record.data.len() as u32;
+            record_ptr = record_offset as usize - record.data.len();
         }
-        Ok(record_ptr)
+        record_ptr as u32
     }
-    /// Writes a new offset given the offset index and the
-    /// actual record ptr.
-    async fn write_record_offset(&self, offset_index: u16, record_ptr: u32, file: &PagedFile) -> Result<(), NetworkError> {
-        let offset = 2 + offset_index * 2;
-        self.inner.write(file, offset as u32, (record_ptr as u16).to_le_bytes().to_vec()).await?;
-        Ok(())
-    }
-    pub async fn write_serialized_record(&self, record: SerializedRecord, file: &PagedFile) -> Result<(), NetworkError> {
-        // Increment and get the new cell count.
-        let new_cell_count = self.increment_cell_count(file).await?;
-
-        // Find a new record pointer.
-        let record_ptr = self.find_new_record_ptr(new_cell_count, &record, file).await?;
-        
-
-        // Write the record.
-        self.inner.write(file, record_ptr, record.data).await?;
-
-        // Calculate the offset.
-        self.write_record_offset(new_cell_count - 1, record_ptr, file).await?;
-        
-        Ok(())
-        
-    }
+    
     
 }
 
+impl Transact<Leaf> {
+    /// Increments and returns the new Cell count.
+    pub fn increment_cell_count(&mut self) -> u16 {
+        let new = self.get_cell_count() + 1;
+        self.set_cell_count(new);
+        new
+    }
+    pub fn set_cell_count(&mut self, cells: u16) {
+        self[0..2].copy_from_slice(&cells.to_le_bytes());
+        // self.inner.write(file, 0, cells.to_le_bytes().to_vec()).await?;
+ 
+    }
+    /// Writes a new offset given the offset index and the
+    /// actual record ptr.
+    fn write_record_offset(&mut self, offset_index: u16, record_ptr: u32) {
+        let offset = (2 + offset_index * 2) as usize;
+        self[offset..offset + 2].copy_from_slice(&(record_ptr as u16).to_le_bytes());
+        // self.inner.write(file, offset as u32, (record_ptr as u16).to_le_bytes().to_vec()).await?;
+        // Ok(())
+    }
+    pub async fn write_record(&mut self, record: Record) -> Result<(), NetworkError> {
+        self.write_serialized_record(record.produce().await?).await
+    }
+    pub async fn write_serialized_record(&mut self, record: SerializedRecord) -> Result<(), NetworkError> {
+        if !self.will_fit(&record) {
+            return Err(NetworkError::RecordWontFit);
+        }
+        // Increment and get the new cell count.
+        let new_cell_count = self.increment_cell_count();
+
+        // Find a new record pointer.
+        let record_ptr = self.find_new_record_ptr(new_cell_count, &record) as usize;
+        
+
+        // Write the record.
+        self[record_ptr..record_ptr + record.data.len()].copy_from_slice(&record.data);
+        // self.inner.write(file, record_ptr, record.data).await?;
+
+        // Calculate the offset.
+        self.write_record_offset(new_cell_count - 1, record_ptr as u32);
+        
+        Ok(())
+        
+    }
+}
 
 
 #[cfg(test)]
 mod tests {
-    use overseer::models::Value;
+    use overseer::{error::NetworkError, models::Value};
     use tempfile::tempdir;
 
     use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::leaf_page::Record};
 
-    use super::LeafPage;
+  
 
     // TODO: Add unit tests to test mid-write failure.
 
@@ -178,40 +190,90 @@ mod tests {
     pub async fn test_leaf_page_basic_set_get_cell_count() {
         let dir = tempdir().unwrap();
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        let leaf = LeafPage::new(paged.new_page().await.unwrap());
-        assert_eq!(leaf.get_cell_count(&paged).await.unwrap(), 0);
+        let leaf = paged.new_page().await.unwrap().leaf();
+        assert_eq!(leaf.get_cell_count(), 0);
 
-        leaf.set_cell_count(&paged, 24).await.unwrap();
+        let leaf = leaf.open(&paged, async |leaf| {
+            leaf.set_cell_count(24);
 
-        assert_eq!(leaf.get_cell_count(&paged).await.unwrap(), 24);
+            Ok(())
+        }).await.unwrap();
+   
+    
+
+        // leaf.set_cell_count(&paged, 24).await.unwrap();
+
+        assert_eq!(leaf.get_cell_count(), 24);
     }
 
     #[monoio::test]
     pub async fn test_leaf_space_calculaion() {
         let dir = tempdir().unwrap();
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        let leaf = LeafPage::new(paged.new_page().await.unwrap());
-        assert_eq!(leaf.get_remaining_space(&paged).await.unwrap(), PAGE_SIZE as u32 - PAGE_HEADER_RESERVED_BYTES - 2);
+        paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
+            assert_eq!(leaf.get_remaining_space(), PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - 2);
+            leaf.write_record(Record { value: Some(Value::Integer(32)) }).await?;
+            assert_eq!(leaf.get_remaining_space(), PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - 4 - 3);
+            Ok(())
+        }).await.unwrap();
+        
 
-        leaf.write_record(Record { value: Some(Value::Integer(32)) }, &paged).await.unwrap();
-        assert_eq!(leaf.get_remaining_space(&paged).await.unwrap(), PAGE_SIZE as u32 - PAGE_HEADER_RESERVED_BYTES - 4 - 3);
+        
+        
+    }
+
+    #[monoio::test]
+    pub async fn test_leaf_page_write_overfit() {
+        let dir = tempdir().unwrap();
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+
+        let massive_string = String::from_utf8(vec![23u8; PAGE_SIZE + 2]).unwrap();
+
+        paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
+            
+            let result = leaf.write_record(Record { value: Some(Value::String(massive_string)) }).await;
+            if let Err(result) = result {
+                assert_eq!(result.to_string(), NetworkError::RecordWontFit.to_string());
+            } else {
+                panic!("Should have errored on overflow but did not.");
+            }
+            
+
+            Ok(())
+        }).await.unwrap();
+        // let leaf = LeafPage::new(paged.new_page().await.unwrap());
+        
+
+        // panic!("LEAF: {:?}", leaf.inner.hexdump(&paged).await.unwrap());
+
+        
     }
 
     #[monoio::test]
     pub async fn test_leaf_page_write_record() {
         let dir = tempdir().unwrap();
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        let leaf = LeafPage::new(paged.new_page().await.unwrap());
-        leaf.write_record(Record { value: Some(Value::Integer(32)) }, &paged).await.unwrap();
-        leaf.write_record(Record { value: Some(Value::Integer(21)) }, &paged).await.unwrap();
-        leaf.write_record(Record { value: Some(Value::String("hello andrew".to_string())) }, &paged).await.unwrap();
+
+        paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
+            leaf.write_record(Record { value: Some(Value::Integer(32)) }).await.unwrap();
+            leaf.write_record(Record { value: Some(Value::Integer(21)) }).await.unwrap();
+            leaf.write_record(Record { value: Some(Value::String("hello andrew".to_string())) }).await.unwrap();
+
+            assert_eq!(leaf.get_cell_count(), 3);
+
+
+
+            assert_eq!(leaf.read_record(0).await.unwrap().unwrap().value, Some(Value::Integer(32)));
+            assert_eq!(leaf.read_record(1).await.unwrap().unwrap().value, Some(Value::Integer(21)));
+            assert_eq!(leaf.read_record(2).await.unwrap().unwrap().value, Some(Value::String("hello andrew".to_string())));
+
+            Ok(())
+        }).await.unwrap();
+        // let leaf = LeafPage::new(paged.new_page().await.unwrap());
+        
 
         // panic!("LEAF: {:?}", leaf.inner.hexdump(&paged).await.unwrap());
 
-        assert_eq!(leaf.get_cell_count(&paged).await.unwrap(), 3);
-
-        assert_eq!(leaf.read_record(0, &paged).await.unwrap().unwrap().value, Some(Value::Integer(32)));
-        assert_eq!(leaf.read_record(1, &paged).await.unwrap().unwrap().value, Some(Value::Integer(21)));
-        assert_eq!(leaf.read_record(2, &paged).await.unwrap().unwrap().value, Some(Value::String("hello andrew".to_string())));
+        
     }
 }

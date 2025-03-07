@@ -62,7 +62,7 @@ impl PagedFile {
         if !object.is_initialized {
             // Initialize the database.
             let mut page = object.reserve(RawPageAddress::zero(), RESERVED_HEADER_SIZE, None).await?;
-            format_pagefile_header(&object, &mut page).await?;
+            format_pagefile_header(&object, page).await?;
 
             object.is_initialized = true;
         } else {
@@ -123,7 +123,7 @@ impl PagedFile {
         // println!("Reference: {:#?}", reference);
 
         let acked = reference.load(self).await?;
-        if acked.free {
+        if acked.metadata.free {
             return Err(NetworkError::PageFreedError);
         }
         Ok(acked)
@@ -168,9 +168,15 @@ impl PagedFile {
     }
 }
 
-async fn format_pagefile_header(file: &PagedFile, page: &Page) -> Result<(), NetworkError>
+async fn format_pagefile_header(file: &PagedFile, page: Page) -> Result<(), NetworkError>
 {
-    page.raw_write(file, 0, vec![MAGIC_BYTE, 0, 0, 0]).await.unwrap();
+    page.normal().open(&file, async |tx| {
+        tx[0] = MAGIC_BYTE;
+
+        Ok(())
+    }).await.unwrap();
+
+    // page.raw_write(file, 0, vec![MAGIC_BYTE, 0, 0, 0]).await.unwrap();
 
 
     Ok(())
@@ -192,14 +198,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
         assert_eq!(paged.file_size as u32, RESERVED_HEADER_SIZE);
-        let page=  paged.new_page().await.unwrap();
-        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
+        let page=  paged.new_page().await.unwrap().normal();
+        assert_eq!(page.page_type(), PageType::Normal);
 
-        page.set_type(PageType::Dummy, &mut paged).await.unwrap();
-        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
+        let page = page.open(&paged, async |f| {
+            f.set_type(PageType::Dummy);
+            assert_eq!(f.page_type(), PageType::Dummy);
+            Ok(())
+        }).await.unwrap();
 
-        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
+        let page = page.reload(&paged).await.unwrap();
+        assert_eq!(page.page_type(), PageType::Dummy);
+
+        // page.set_type(PageType::Dummy, &mut paged).await.unwrap();
+        // assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
+
+        // let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
+        // assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Dummy);
         
     
     }
@@ -215,12 +230,19 @@ mod tests {
 
         assert_eq!(paged.file_size as usize, RESERVED_HEADER_SIZE as usize + PAGE_SIZE + PAGE_SIZE);
 
-        let mut page = paged.acquire(0).await.unwrap();
-        page.write(&paged, 0, vec![1,2,3]).await.unwrap();
-        assert_eq!(&page.read(&paged, 0, 3).await.unwrap(), &[1,2,3]);
+        let page = paged.acquire(0).await.unwrap().normal().open(&paged, async |page| {
+            page[..3].copy_from_slice(&[1,2,3]);
+            Ok(())
+        }).await.unwrap();
+        // let mut page = paged.acquire(0).await.unwrap().normal().transact();
+        // page[..3].copy_from_slice(&[1,2,3]);
+        // let page = page.commit(&paged).await.unwrap();
+
+
+        assert_eq!(&page[..3], &[1,2,3]);
 
         let paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        assert_eq!(&page.read(&paged, 0, 3).await.unwrap(), &[1,2,3]);
+        assert_eq!(&page[..3], &[1,2,3]);
     }
 
     #[monoio::test]
@@ -231,15 +253,15 @@ mod tests {
         assert_eq!(paged.free_pages(), 0);
 
         let mut page = paged.acquire(0).await.unwrap();
-        assert!(!page.free);
+        assert!(!page.metadata.free);
         page.free(&mut paged).await.unwrap();
-        assert!(page.free);
+        assert!(page.metadata.free);
         assert_eq!(paged.free_pages(), 1);
 
  
 
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        assert!(page.free);
+        assert!(page.metadata.free);
         assert_eq!(paged.free_pages(), 1);
 
         // Check to see that free pages are recycled.
@@ -259,21 +281,21 @@ mod tests {
 
         assert_eq!(page.start().page_number(), 0);
         assert!(!page.has_next());
-        println!("Page previous: {:?}", page.previous);
-        assert!(page.previous.is_zero());
+        println!("Page previous: {:?}", page.metadata.previous);
+        assert!(page.metadata.previous.is_zero());
 
         let chain = page.get_next(&mut paged).await.unwrap();
-        assert!(page.previous.is_zero());
+        assert!(page.metadata.previous.is_zero());
         assert!(page.has_next());
         assert_eq!(page.get_next(&mut paged).await.unwrap().start().page_number(), chain.start().page_number());
-        assert_eq!(chain.previous.page_number(), 0);
-        assert_eq!(page.next.page_number(), 1);
+        assert_eq!(chain.metadata.previous.page_number(), 0);
+        assert_eq!(page.metadata.next.page_number(), 1);
 
         let paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
         let page_a = paged.acquire(0).await.unwrap();
         let page_b = paged.acquire(1).await.unwrap();
-        assert_eq!(page_a.next.page_number(), 1);
-        assert_eq!(page_b.previous.page_number(), 0);
+        assert_eq!(page_a.metadata.next.page_number(), 1);
+        assert_eq!(page_b.metadata.previous.page_number(), 0);
         
     }
 
@@ -290,12 +312,12 @@ mod tests {
         assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
         page.set_next(&paged, 23).await.unwrap();
         assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
-        assert_eq!(page.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
+        assert_eq!(page.metadata.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
 
         page.set_previous(&paged, 78).await.unwrap();
         assert_eq!(page.get_type(&mut paged).await.unwrap(), PageType::Normal);
-        assert_eq!(page.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
-        assert_eq!(page.previous.as_u64(), RESERVED_HEADER_SIZE as u64 + 78 * PAGE_SIZE as u64);
+        assert_eq!(page.metadata.next.as_u64(), RESERVED_HEADER_SIZE as u64 + 23 * PAGE_SIZE as u64);
+        assert_eq!(page.metadata.previous.as_u64(), RESERVED_HEADER_SIZE as u64 + 78 * PAGE_SIZE as u64);
 
 
 
