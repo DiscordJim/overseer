@@ -362,6 +362,9 @@ impl<P> Projection<P> {
     pub fn page_type(&self) -> PageType {
         self.page.metadata.page_type
     }
+    pub fn view(&self) -> &[u8] {
+        &self.page.backing
+    }
 }
 
 impl<K> Transact<K> {
