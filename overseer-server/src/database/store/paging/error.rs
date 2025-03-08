@@ -18,7 +18,22 @@ pub enum PageError {
     #[error("Failed to read a free block into memory")]
     FailedReadingFreeBlock,
     #[error("Allocation details did not make sense")]
-    BadAllocation
+    BadAllocation,
+    #[error("Record deserialization failure")]
+    RecordDeserializationFailure
+}
+
+impl PageError {
+    pub fn variant(&self) -> usize {
+        match self {
+            Self::LeafPageFull => 0,
+            Self::IoError(..) => 1,
+            Self::NoRecordFound => 2,
+            Self::FailedReadingFreeBlock => 3,
+            Self::BadAllocation => 4,
+            Self::RecordDeserializationFailure => 5
+        }
+    }
 }
 
 // impl Into<NetworkError> for PageError {

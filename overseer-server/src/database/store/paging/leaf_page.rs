@@ -5,7 +5,7 @@
 //! The fragmented bytes counts not only genuinely fragmented memory but also "detractive" memory which is that
 //! which may be considered unnecessary, such as free list allocations.
 
-use std::io::Cursor;
+use std::{io::Cursor, process::exit};
 
 use overseer::{error::NetworkError, models::Value, network::{OverseerSerde, OvrInteger}};
 
@@ -144,12 +144,15 @@ impl Projection<Leaf> {
     pub const fn header_size() -> usize {
         10
     }
-    pub fn calculate_offset_index(&self, index: usize) -> usize {
+    pub fn calculate_offset_index(index: usize) -> usize {
         Self::header_size() + index * 2
     }
     /// Reads an offset given an index.
     pub fn get_offset(&self, index: usize) -> usize {
-        let pos = self.calculate_offset_index(index);
+        let pos = Self::calculate_offset_index(index);
+
+        // let unitary = u16::from_le_bytes(self[pos .. pos + 2].try_into().unwrap()) as usize;
+        // if index == 2 { println!("2 {unitary}"); exit(1) };
         u16::from_le_bytes(self[pos .. pos + 2].try_into().unwrap()) as usize
     }
     /// Checks if a record will fit into the database.
@@ -257,7 +260,7 @@ impl Projection<Leaf> {
     }
 
     /// Reads a record if it exists.
-    pub async fn read_record(&self, index: usize) -> Result<Option<Record>, NetworkError>
+    pub async fn read_record(&self, index: usize) -> Result<Option<Record>, PageError>
     {
         if index >= self.get_cell_count() {
             return Ok(None);
@@ -269,7 +272,7 @@ impl Projection<Leaf> {
             // read the size first.
             OvrInteger::read::<usize, _>(&mut reader).await?;
             // now deserialize the record.
-            let record = Record::deserialize(&mut reader).await?;
+            let record = Record::deserialize(&mut reader).await.map_err(|_| PageError::RecordDeserializationFailure)?;
 
             Ok(Some(record))
         }
@@ -279,6 +282,7 @@ impl Projection<Leaf> {
     pub fn check_record_exists(&self, record: usize) -> bool {
         // If an offset is zero, then it would be pointing to the cell count which
         // is clearly not a valid offset.
+        
         self.get_offset(record) != 0
     }
 
@@ -373,15 +377,15 @@ impl Transact<Leaf> {
         let record_ptr = record_allocation.location;
         println!("Record Ptr: {}", record_ptr);
 
-        let total_usage = 2 + record.total_serialized_size();
+        // let total_usage = 2 + record.total_serialized_size();
         
         let size = OvrInteger::to_bytes(record.data.len()).await;
 
         // Update the free space.
         
-        println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
-        self.set_used_space(self.get_used_space() + (2 + record.total_serialized_size()));
-        println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
+        // println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
+        // self.set_used_space(self.get_used_space() + (2 + record.total_serialized_size()));
+        // println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
 
         // Write the record.
         self[record_ptr..record_ptr + size.len()].copy_from_slice(&size);
@@ -392,6 +396,8 @@ impl Transact<Leaf> {
         self.write_record_offset(new_cell_count as usize - 1, record_ptr);
 
         // Commit this to the lead pointer.
+        // The solver does not take the offset into account, so we need to update this.
+        self.set_used_space(self.get_used_space() + 2);
         self.solve_allocate(record_allocation)?;
         // self.set_lead_offset(self.get_lead_offset() + total_usage);
         
@@ -421,6 +427,7 @@ impl Transact<Leaf> {
         if allocation.is_lead_allocation {
             // Simple to solve these allocations, we just push the pointer. 
             self.set_lead_offset(self.get_lead_offset() + allocation.size);
+            
         } else {
             // A little more complex.
             let Some(fb) = allocation.free_block else {
@@ -440,6 +447,7 @@ impl Transact<Leaf> {
             }
             
         }
+        self.set_used_space(self.get_used_space() + allocation.size);
         Ok(())
     }
 
@@ -498,14 +506,33 @@ impl Transact<Leaf> {
             // Use a non-active block.
             FreeBlock::write(self, pointer, next_ptr, start, size);
             Ok(())
+        }
+        else if (start + size) == current.offset as usize {
+            // println!("LEFT EDGE...");
+            // exit(1);
+            // Solves a left edge.
+            //
+            // Essentially, if there are two open spaces next to eachoher it is more efficient to combine them.
+            FreeBlock::write(self, current.position, current.next as usize, start, current.size as usize + size);
+            Ok(())
+        } else if (current.offset + current.size) as usize == start {
+            // Solves a right edge.
+            //
+            // Essentially, if there are two open spaces right next to eachother, it is more efficient to consider them a single
+            // open space.
+            // We just extend this block.
+            FreeBlock::write(self, current.position, current.next as usize, current.offset as usize, current.size as usize + size);
+            // println!("SOLVED EGDE");
+            Ok(())
         } else if current.next == 0 {
             println!("Descending allocating new blocck w/ {}", size);
             // End of the chain, allocate a new block
+            
             let new_block = self.allocate_free_block(start, size)?;
             println!("New pointer for {:?} is {new_block}", previous);
             
             // Update the previous block.
-            FreeBlock::write(self, previous.position, new_block, previous.offset as usize, previous.size as usize);
+            FreeBlock::write(self, current.position, new_block, current.offset as usize, current.size as usize);
         
             
             Ok(())
@@ -524,9 +551,17 @@ impl Transact<Leaf> {
     /// 
     /// It will however shift over the offsets.
     fn simple_delete(&mut self, record: usize) -> Result<(), PageError> {
+        
         if !self.check_record_exists(record) {
+            // println!("DELETING RECORD E: {record}");
+            // if record == 2 { exit(1) };
             return Err(PageError::NoRecordFound)?;
         }
+        
+
+        
+
+        
 
         // The initial cell count before we perform the deletion.
         let initial_cell_count = self.get_cell_count();
@@ -543,7 +578,7 @@ impl Transact<Leaf> {
         self[offset..offset + size].fill(0);
 
         // Update the used space.
-        self.set_used_space(self.get_used_space() - (size));
+        self.set_used_space(self.get_used_space() - (2 + size));
 
         // Update the record count.
         self.set_cell_count(initial_cell_count - 1);
@@ -551,8 +586,8 @@ impl Transact<Leaf> {
         // Shift the offsets over.
         if initial_cell_count > 1 {
             // If we had more than one we are going to need to shift these over.
-            let to_shift = self.calculate_offset_index(record);
-            let end_shft = self.calculate_offset_index(initial_cell_count - 1);
+            let to_shift = Projection::<Leaf>::calculate_offset_index(record);
+            let end_shft = Projection::<Leaf>::calculate_offset_index(initial_cell_count - 1);
 
             // Recall that the record offset is zeroed,
             // so we just need to rotate the
@@ -579,7 +614,7 @@ mod tests {
     use overseer::{error::NetworkError, models::Value};
     use tempfile::tempdir;
 
-    use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::{leaf_page::Record, page::{Projection, Transact}}};
+    use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::{error::PageError, leaf_page::{FreeBlock, Record}, page::{Projection, Transact}}};
 
     use super::Leaf;
 
@@ -596,19 +631,59 @@ mod tests {
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
         paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
             
-            leaf.write_record(Record { value: Some(Value::Integer(339939393)) }).await?;
-            leaf.write_record(Record { value: Some(Value::Integer(332)) }).await?;
-            leaf.write_record(Record { value: Some(Value::Integer(83920320039092)) }).await?;
-            
-            // println!("hello: {:?}", leaf.view());
+            // Get the records.
+            let record_a = Record { value: Some(Value::Integer(339939393)) }.produce().await;
+            let record_b = Record { value: Some(Value::Integer(332)) }.produce().await;
+            let record_c = Record { value: Some(Value::Integer(83920320039092)) }.produce().await;
+            let record_d = Record { value: Some(Value::Integer(83920320039092333)) }.produce().await;
 
-        
+            // Get the totals.
+            let total_a = record_a.total_serialized_size();
+            let total_b = record_b.total_serialized_size();
+            let total_c = record_c.total_serialized_size();
+            let total_d = record_d.total_serialized_size();
+
+            // Write the records.
+            leaf.write_serialized_record(record_a).await?;
+            leaf.write_serialized_record(record_b).await?;
+            leaf.write_serialized_record(record_c).await?;
+            
+     
+
+            // Delete.
             leaf.simple_delete(1)?;
+
+            // Verify the free chain is correct.
+            let fc = leaf.read_free_chain()?;
+            assert_eq!(fc.len(), 1);
+            assert_eq!(fc.first().unwrap().size as usize, total_b);
+
             leaf.simple_delete(0)?;
 
-            println!("leaf: {:?}", &leaf[..40]);
-            println!("leaf: {:?}", &leaf[4020..]);
-            println!("wow: {:?}", leaf.read_free_chain().unwrap());
+            // Verify the free chain is correct.
+            let fc = leaf.read_free_chain()?;
+            assert_eq!(fc.len(), 1);
+            assert_eq!(fc.first().unwrap().size as usize, total_b + total_a);
+
+        
+            leaf.simple_delete(0)?;
+
+            // Verify the free chain is correct.
+            let fc = leaf.read_free_chain()?;
+            assert_eq!(fc.len(), 1);
+            assert_eq!(fc.first().unwrap().size as usize, total_a + total_b + total_c);
+
+            // This allocation should be performed into fragmented space.
+            leaf.write_serialized_record(record_d).await?;
+
+            // Verify the free chain is correct.
+            let fc = leaf.read_free_chain()?;
+            assert_eq!(fc.len(), 1);
+            assert_eq!(fc.first().unwrap().size as usize, (total_a + total_b + total_c) - total_d);
+
+            // println!("leaf: {:?}", &leaf[..40]);
+            // println!("leaf: {:?}", &leaf[4020..]);
+            // println!("wow: {:?}", leaf.read_free_chain().unwrap());
 
             // leaf.write_record(Record { value: Some(Value::Integer(3)) }).await?;
 
@@ -690,7 +765,7 @@ mod tests {
             leaf.write_serialized_record(record).await?;
             assert_eq!(leaf.get_free_space(), base - record_space - 2);
             leaf.simple_delete(0)?;
-            assert_eq!(leaf.get_free_space(), base);
+            assert_eq!(leaf.get_free_space(), base - FreeBlock::size());
             Ok(())
         }).await.unwrap();
         
@@ -708,9 +783,10 @@ mod tests {
 
         paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
             
-            let result = leaf.write_record(Record { value: Some(Value::String(massive_string)) }).await;
+            let result: Result<(), PageError> = leaf.write_record(Record { value: Some(Value::String(massive_string)) }).await;
             if let Err(result) = result {
-                assert_eq!(result.to_string(), NetworkError::RecordWontFit.to_string());
+                
+                assert_eq!(result.variant(), PageError::LeafPageFull.variant());
             } else {
                 panic!("Should have errored on overflow but did not.");
             }

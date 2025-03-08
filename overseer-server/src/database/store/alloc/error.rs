@@ -7,5 +7,6 @@ pub enum FrameAllocatorError {
     #[error("Requested a frame that is out of bounds.")]
     FrameOutOfBounds,
     #[error("Requested a frame that was already in use")]
-    FrameInUse
+    FrameInUse,
+    
 }

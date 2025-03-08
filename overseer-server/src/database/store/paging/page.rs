@@ -4,7 +4,7 @@ use overseer::{error::NetworkError, models::LocalReadAsync};
 
 use crate::database::store::file::{PagedFile, MAGIC_BYTE, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE, RESERVED_HEADER_SIZE};
 
-use super::{leaf_page::Leaf, meta::{PageType, RawPageAddress}};
+use super::{error::PageError, leaf_page::Leaf, meta::{PageType, RawPageAddress}};
 
 #[derive(Debug)]
 /// This is a page that has not been loaded into
@@ -312,9 +312,9 @@ impl<P> Projection<P> {
             page: self
         }
     }
-    pub async fn open<F>(self, page_file: &PagedFile, functor: F) -> Result<Self, NetworkError>
+    pub async fn open<F>(self, page_file: &PagedFile, functor: F) -> Result<Self, PageError>
     where 
-        F: AsyncFnOnce(&mut Transact<P>) -> Result<(), NetworkError>
+        F: AsyncFnOnce(&mut Transact<P>) -> Result<(), PageError>
 
     {
   
@@ -368,7 +368,7 @@ impl<P> Projection<P> {
 }
 
 impl<K> Transact<K> {
-    pub async fn commit(self, file: &PagedFile) -> Result<Projection<K>, NetworkError> {
+    pub async fn commit(self, file: &PagedFile) -> Result<Projection<K>, PageError> {
         let (r, buf) = file.handle().write_all_at(self.page.page.backing, self.page.page.reference.pointer.as_u64()).await;
         r?;
         Ok(Projection {
