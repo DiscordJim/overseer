@@ -1,12 +1,22 @@
+//!
+//! The B-tree page.
+//! 
+//! 
+//! The fragmented bytes counts not only genuinely fragmented memory but also "detractive" memory which is that
+//! which may be considered unnecessary, such as free list allocations.
+
 use std::io::Cursor;
 
-use overseer::{error::NetworkError, models::Value, network::OverseerSerde};
+use overseer::{error::NetworkError, models::Value, network::{OverseerSerde, OvrInteger}};
 
 
 use crate::database::store::file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE};
 
-use super::page::{Page, Projection, Transact};
+use super::{error::PageError, page::{Page, Projection, Transact}};
 
+
+/// How many slots a free block has.
+const FRAGMENTATION_SIZE: usize = 4;
 
 pub struct Leaf;
 
@@ -22,23 +32,26 @@ pub struct Record {
 
 pub struct SerializedRecord {
     value: Record,
-    data: Vec<u8>
+    data: Vec<u8>,
 }
 
 impl Record {
-    pub async fn produce(self) -> Result<SerializedRecord, NetworkError> {
+    pub async fn produce(self) -> SerializedRecord {
         let mut cursor = Cursor::new(vec![]);
         self.serialize(&mut cursor).await.unwrap();
-        Ok(SerializedRecord {
+        SerializedRecord {
             value: self,
             data: cursor.into_inner()
-        })
+        }
     }
 }
 
 impl SerializedRecord {
     pub fn to_record(self) -> Record {
         self.value
+    }
+    pub fn total_serialized_size(&self) -> usize {
+        self.data.len() + OvrInteger::required_space(self.data.len())
     }
 }
 
@@ -57,45 +70,193 @@ impl OverseerSerde<Record> for Record {
     }
 }
 
+
+
+struct Allocation {
+    location: usize,
+    /// The free block bytes in case we need to zero them.
+    free_block: Option<FreeBlock>,
+    size: usize,
+    is_lead_allocation: bool
+}
+
+#[derive(Debug)]
+struct FreeBlock {
+    /// Where the free block is located, this
+    /// is not written nor read.
+    position: usize,
+    next: u16,
+    offset: u16,
+    size: u16
+}
+
+impl FreeBlock {
+    pub const fn size() -> usize {
+        2 + 2 + 2
+    }
+    pub fn read(position: usize, array: &Projection<Leaf>) -> Result<Self, PageError> {
+        let array = &array[position..];
+        let next = u16::from_le_bytes(array[0..2].try_into().map_err(|_| PageError::FailedReadingFreeBlock)?);
+        let offset = u16::from_le_bytes(array[2..4].try_into().map_err(|_| PageError::FailedReadingFreeBlock)?);
+        let size = u16::from_le_bytes(array[4..6].try_into().map_err(|_| PageError::FailedReadingFreeBlock)?);
+        Ok(Self {
+            position,
+            next,
+            offset,
+            size
+        })
+    }
+    pub fn write(array: &mut Transact<Leaf>, start: usize, next: usize, offset: usize, size: usize) {
+        let subset = &mut array[start..];
+        subset[0..2].copy_from_slice(&(next as u16).to_le_bytes());
+        subset[2..4].copy_from_slice(&(offset as u16).to_le_bytes());
+        subset[4..6].copy_from_slice(&(size as u16).to_le_bytes());
+    }
+}
+
 impl Projection<Leaf> {
     pub fn get_cell_count(&self) -> usize {
         u16::from_le_bytes(self[0..2].try_into().unwrap()) as usize
     }
-    
-
-    pub fn get_offset(&self, index: usize) -> usize {
-        let pos = (2 + index * 2) as usize;
-        u16::from_le_bytes(self[pos .. pos + 2].try_into().unwrap()) as usize
+    pub fn get_used_space(&self) -> usize {
+        u16::from_le_bytes(self[2..4].try_into().unwrap()) as usize
     }
 
-    pub fn get_remaining_space(&self) -> usize {
-        let count = self.get_cell_count();
-        if count == 0 {
-            self.capacity() - 2
-        } else {
-            // The count + Offsets + the last offset.
-            let total_used = 2 + 2 * count as usize;
-            let final_offset = self.size() - self.get_offset((count - 1) as usize) as usize - PAGE_HEADER_RESERVED_BYTES as usize;
-            self.capacity() - (total_used + final_offset)
-        }
+    pub fn get_free_space(&self) -> usize {
+        self.capacity() - Self::header_size() - self.get_used_space()
+    }
+    pub fn get_free_block_ptr(&self) -> usize {
+        u16::from_le_bytes(self[4..6].try_into().unwrap()) as usize
+    }
+    pub fn get_lead_offset(&self) -> usize {
+        u16::from_le_bytes(self[6..8].try_into().unwrap()) as usize
+    }
+    pub fn get_fragmented(&self) -> usize {
+        u16::from_le_bytes(self[8..10].try_into().unwrap()) as usize
+    }
+
+    /// The header has the following structure
+    /// [ Cell Count (2) ]
+    /// [ Used Space (2) ]
+    /// [ Free Block Ptr (2) ] - For finding space.
+    /// [ Lead Offset (2) ] - For fresh allocation.
+    /// [ Fragmented Bytes (2) ] - The amount of fragmentation.
+    pub const fn header_size() -> usize {
+        10
+    }
+    pub fn calculate_offset_index(&self, index: usize) -> usize {
+        Self::header_size() + index * 2
+    }
+    /// Reads an offset given an index.
+    pub fn get_offset(&self, index: usize) -> usize {
+        let pos = self.calculate_offset_index(index);
+        u16::from_le_bytes(self[pos .. pos + 2].try_into().unwrap()) as usize
     }
     /// Checks if a record will fit into the database.
     pub fn will_fit(&self, record: &SerializedRecord) -> bool {
-        let remaining = self.get_remaining_space();
-        record.data.len() + 2 <= remaining as usize
+        let remaining = self.get_free_space();
+        record.data.len() + Self::header_size() <= remaining as usize
     }
 
     /// Determines the size of a record on the leaf page.
     pub fn get_record_size(&self, record: usize) -> Option<usize> {
-        if record >= self.get_cell_count() as usize {
-            None 
-        } else if record == 0 {
-            Some(self.capacity() - self.get_offset(record) as usize)
+        let (_, actual) = self.get_record_size_characteristics(record)?;
+        Some(actual)
+    }
+    /// Determines the full size of a record including the size pointer.
+    pub fn get_total_record_size(&self, record: usize) -> Option<usize> {
+        let (length, actual) = self.get_record_size_characteristics(record)?;
+        Some(length + actual)
+    }
+    /// Determines the full details of a record's size on isk.
+    pub fn get_record_size_characteristics(&self, record: usize) -> Option<(usize, usize)> {
+        if !self.check_record_exists(record) {
+            None
         } else {
-            Some(self.get_offset(record - 1) as usize - self.get_offset(record) as usize)
+            let record_size = OvrInteger::read_slice(&self[self.get_offset(record)..]).unwrap();
+            Some((OvrInteger::required_space(record_size), record_size))
         }
     }
-    
+
+    /// Determines if an allocation can be made within a page.
+    /// 
+    /// If it can, then we return a pointer to the allocation location.
+    pub fn can_allocate(&self, size: usize) -> Option<Allocation> {
+        if size >= self.get_free_space() {
+            // No allocaion is possible.
+            None
+        } else {
+            // We need to read the free list.
+            match self.find_free_slot(size) {
+                // Use the free block allocation.
+                Some(alloc) => Some(alloc),
+                // Fall back to allocating with the lead pointr.
+                None => self.try_alloc_lead(size)
+            }
+        }
+    }
+
+    /// Tries allocating with the lead pointer.
+    pub fn try_alloc_lead(&self, size: usize) -> Option<Allocation> {
+        let lead_ptr = self.capacity() - self.get_lead_offset() - size;
+        let offset_size = Self::header_size() + 2 * self.get_cell_count();
+
+        // Check if this allocation would leak into the offsets/page header.
+        // To understand the calculation taking place here, if we are so large
+        // that we are pushed to the same size or less then we will leak.
+        //
+        // TODO: Is the equal necessary?
+        if lead_ptr <= offset_size {
+            None
+        } else {
+            // Approve the allocation.
+            Some(Allocation {
+                free_block: None,
+                size,
+                location: lead_ptr,
+                is_lead_allocation: true
+            })
+        }
+
+    }
+
+    /// Find suitable free block.
+    fn find_free_slot(&self, size: usize) -> Option<Allocation> {
+        println!("Finding a free block... for size {}", size);
+        let star = self.get_free_block_ptr();
+        if star == 0 {
+            // We do not even have a running free block so how
+            // could we use it to allocate space?
+            None
+        } else {
+            // Search the free chain in hopes of finding a block.
+            self.descend_free_chain(star, size)
+        }
+    }  
+
+    /// Descend free chain
+    fn descend_free_chain(&self, pointer: usize, size: usize) -> Option<Allocation> {
+        
+        let block = FreeBlock::read(pointer, self).ok()?;
+        if block.size as usize >= size && block.offset != 0 {
+            // We must always check if the offset is zero, this indicates a block that can be skipped.
+            let offset = block.offset as usize;
+            Some(Allocation {
+                free_block: Some(block),
+                size,
+                is_lead_allocation: false,
+                location: offset
+            })
+        } else if block.next == 0 {
+            // You've reached the end of the chain.
+            None
+        } else {
+            // Descend again.
+            self.descend_free_chain(pointer, size)
+        }
+    }
+
+    /// Reads a record if it exists.
     pub async fn read_record(&self, index: usize) -> Result<Option<Record>, NetworkError>
     {
         if index >= self.get_cell_count() {
@@ -105,35 +266,61 @@ impl Projection<Leaf> {
             let offset = self.get_offset(index);
 
             let mut reader = self.reader(offset as usize);
+            // read the size first.
+            OvrInteger::read::<usize, _>(&mut reader).await?;
+            // now deserialize the record.
             let record = Record::deserialize(&mut reader).await?;
-
-            // let offset = self.get_offset(index as u32) + PAGE_HEADER_RESERVED_BYTES as u16;
-            // let mut page_reader = paged.reader(actual_offset);
-            // let record = Record::deserialize(&mut page_reader).await?;
 
             Ok(Some(record))
         }
     }
 
+    /// Checks if a record exists.
+    pub fn check_record_exists(&self, record: usize) -> bool {
+        // If an offset is zero, then it would be pointing to the cell count which
+        // is clearly not a valid offset.
+        self.get_offset(record) != 0
+    }
+
 
     
 
+    // fn check_fragmented_fit(&self, offset_index: usize, space_needed: usize) -> bool {
+    //     let offset = self.get_offset(offset_index);
+    //     if offset == 0 {
+    //         // This is a free offset.
+    //     } else {
+    //         false
+    //     }
+    // }
+
+    /// Reads the free chain, mostly for testing.
+    fn read_free_chain(&self) -> Result<Vec<FreeBlock>, PageError> {
+        let mut traversal = vec![];
+        let first = self.get_free_block_ptr();
+        Ok(if first == 0 {
+            traversal
+        } else {
+            let mut block = FreeBlock::read(first, self)?;
+
+            while block.next != 0 {
+                let next_ptr = block.next as usize;
+                traversal.push(block);
+                block = FreeBlock::read(next_ptr, self)?;
+            }
+            traversal.push(block);
+            
+            traversal
+        })
+    }
+    
     
     /// Finds a new record pointer location in the file. This takes in the new cell count,
     /// which is the cell count including this new record.
-    fn find_new_record_ptr(&self, cell_count: usize, record: &SerializedRecord) -> usize {
-        let record_ptr;
-        if cell_count == 1 {
-            // first record in the page.
-            record_ptr = self.capacity() - record.data.len();
-
-        } else {
-            // Get the previous record offset.
-            let record_offset = self.get_offset((cell_count - 2) as usize);
-
-            record_ptr = record_offset as usize - record.data.len();
-        }
-        record_ptr
+    /// 
+    /// This is just a short cut to the allocate metho.
+    fn find_new_record_ptr(&self, record: &SerializedRecord) -> Option<Allocation> {
+        self.can_allocate(record.total_serialized_size())
     }
     
     
@@ -151,113 +338,238 @@ impl Transact<Leaf> {
         // self.inner.write(file, 0, cells.to_le_bytes().to_vec()).await?;
  
     }
+    pub fn set_used_space(&mut self, total: usize) {
+        self[2..4].copy_from_slice(&(total as u16).to_le_bytes());
+    }
+    pub fn set_free_ptr(&mut self, ptr: usize) {
+        self[4..6].copy_from_slice(&(ptr as u16).to_le_bytes());
+    }
+    pub fn set_lead_offset(&mut self, ptr: usize) {
+        self[6..8].copy_from_slice(&(ptr as u16).to_le_bytes());
+    }
+    pub fn set_fragmented(&mut self, count: usize) {
+        self[8..10].copy_from_slice(&(count as u16).to_le_bytes());
+    }
     /// Writes a new offset given the offset index and the
     /// actual record ptr.
+    /// 
+    /// This is the physical offset. 
     fn write_record_offset(&mut self, offset_index: usize, record_ptr: usize) {
-        let offset = 2 + offset_index * 2;
+        let offset = Projection::<Leaf>::header_size() + offset_index * 2;
         self[offset..offset + 2].copy_from_slice(&(record_ptr as u16).to_le_bytes());
-        // self.inner.write(file, offset as u32, (record_ptr as u16).to_le_bytes().to_vec()).await?;
-        // Ok(())
     }
-    pub async fn write_record(&mut self, record: Record) -> Result<(), NetworkError> {
-        self.write_serialized_record(record.produce().await?).await
+    pub async fn write_record(&mut self, record: Record) -> Result<(), PageError> {
+        self.write_serialized_record(record.produce().await).await
     }
-    pub async fn write_serialized_record(&mut self, record: SerializedRecord) -> Result<(), NetworkError> {
+    pub async fn write_serialized_record(&mut self, record: SerializedRecord) -> Result<(), PageError> {
         if !self.will_fit(&record) {
-            return Err(NetworkError::RecordWontFit);
+            return Err(PageError::LeafPageFull);
         }
         // Increment and get the new cell count.
         let new_cell_count = self.increment_cell_count();
 
         // Find a new record pointer.
-        let record_ptr = self.find_new_record_ptr(new_cell_count, &record) as usize;
+        let record_allocation = self.find_new_record_ptr(&record).ok_or_else(|| PageError::LeafPageFull)?;
+        let record_ptr = record_allocation.location;
+        println!("Record Ptr: {}", record_ptr);
+
+        let total_usage = 2 + record.total_serialized_size();
         
+        let size = OvrInteger::to_bytes(record.data.len()).await;
+
+        // Update the free space.
+        
+        println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
+        self.set_used_space(self.get_used_space() + (2 + record.total_serialized_size()));
+        println!("Writing new space {}", self.get_used_space() + (2 + record.total_serialized_size()));
 
         // Write the record.
-        self[record_ptr..record_ptr + record.data.len()].copy_from_slice(&record.data);
+        self[record_ptr..record_ptr + size.len()].copy_from_slice(&size);
+        self[record_ptr + size.len()..record_ptr + record.data.len() + size.len()].copy_from_slice(&record.data);
         // self.inner.write(file, record_ptr, record.data).await?;
 
         // Calculate the offset.
         self.write_record_offset(new_cell_count as usize - 1, record_ptr);
+
+        // Commit this to the lead pointer.
+        self.solve_allocate(record_allocation)?;
+        // self.set_lead_offset(self.get_lead_offset() + total_usage);
+        
         
         Ok(())
         
     }
-    pub async fn delete_record(&mut self, record: usize) -> Result<(), NetworkError> {
-        if record >= self.get_cell_count() as usize {
-            // This does not exist.
-            return Err(NetworkError::PageOutOfBounds)?;
-        } else if self.get_cell_count() == 1 {
-            self.set_cell_count(0);
-            let start=  self.get_offset(record);
-            let size = self.get_record_size(record).unwrap();
-            self[start..start + size].fill(0);
-            self.write_record_offset(0, 0);
-            return Ok(())
+
+
+    // /// Allocate free block
+    // /// 
+    // /// This returns the pointer to the free block.
+    // fn allocate_free_block(&mut self) -> Result<usize, PageError> {
+    //     let total_free_block_size = 2 + FREE_BLOCK_SLOTS * 2;
+    
+
+        
+
+        
+    // }
+
+
+    
+    /// Solves an allocation, this means we update the information used
+    /// to make the allocation after we are done.
+    fn solve_allocate(&mut self, allocation: Allocation) -> Result<(), PageError> {
+        if allocation.is_lead_allocation {
+            // Simple to solve these allocations, we just push the pointer. 
+            self.set_lead_offset(self.get_lead_offset() + allocation.size);
+        } else {
+            // A little more complex.
+            let Some(fb) = allocation.free_block else {
+                // If this is none then that means we did not
+                // allocate through the free pointer NOR did we allocate
+                // through the lead pointer which makes no sense.
+                return Err(PageError::BadAllocation);
+            };
+            if allocation.size == fb.size as usize {
+                // We have used it up, so this is empty.
+                FreeBlock::write(self, fb.position, fb.next as usize, 0, 0);
+            } else {
+                println!("Allocation size: {}, Total: {}", allocation.size, fb.size);
+                // We have not used this up, so it is not empty.
+                self.adjust_free_block(fb.offset as usize + allocation.size, fb.size as usize - allocation.size, fb);
+                // FreeBlock::write(self, fb.position, fb.next as usize, , fb.size as usize - allocation.size);
+            }
+            
+        }
+        Ok(())
+    }
+
+    fn adjust_free_block(&mut self, new_offset: usize, new_size: usize, block: FreeBlock) {
+        if new_size <= FRAGMENTATION_SIZE {
+            // No point, these are just fragmented bytes.
+            FreeBlock::write(self, block.position, block.next as usize, 0, 0);
+            self.set_fragmented(self.get_fragmented() + new_size);
+        } else {
+            // Adjust the free block details.
+            FreeBlock::write(self, block.position, block.next as usize, new_offset, new_size);
+        }
+    }
+
+
+    /// Updates the free list in the page.
+    fn update_free_list(&mut self, start: usize, size: usize) -> Result<(), PageError> {
+        // if size <= FRAGMENTATION_SIZE {
+        //     // No real point in doing anything with this.
+        //     self.set_fragmented(self.get_fragmented() + size);
+        //     return Ok(())
+        // }
+        let free_list_pointer = self.get_free_block_ptr();
+        if free_list_pointer == 0 {
+            // The free chain thing is not initialized yet.
+            let new_ptr = self.allocate_free_block(start, size)?;
+            self.set_free_ptr(new_ptr);
+        } else {
+            // We do have a free chain.
+            println!("Descending down chain");
+            self.update_free_chain(None, free_list_pointer, start, size)?;
         }
 
-        // Get the record size, this will help us calculate the offsets.
-        let record_size = self.get_record_size(record).unwrap();
-        let record_offset = self.get_offset(record);
-        println!("Deleting a record of size {}", record_size);
+        Ok(())
+    }
 
-        // println!("View (0): {:?}", &self.view()[..40]);
+    /// Tries to allocate a freelist block at a pointer.
+    fn allocate_free_block(&mut self, offset: usize, size: usize) -> Result<usize, PageError> {
+        // Define and determine a location.
+        let allocate = self.can_allocate(FreeBlock::size()).ok_or_else(|| PageError::LeafPageFull)?;
+        let location = allocate.location;
+        // Write the new free block.
+        FreeBlock::write(self, allocate.location, 0, offset, size);
+        // Solve the allocatin.
+        self.solve_allocate(allocate)?;
 
-        // Move the other stuff on the record.
-        let lower = self.get_offset(self.get_cell_count() - 1);
-        let upper = self.get_offset(record + 1) + self.get_record_size(record + 1).unwrap();
-        println!("View (1): {:?}", &self.view()[4050..]);
-
-        let to_move = self[lower..upper].to_vec();
-        println!("To move: {:?}", to_move);
-
-        self[lower..upper + record_size].fill(0);
-        println!("View (2): {:?}", &self.view()[4050..]);
-
-        // Actually shift the bytes.
-        self[lower + record_size..upper + record_size].copy_from_slice(&to_move);
-        println!("View (3): {:?}", &self.view()[4050..]);
-
-
-
-        for i in record + 1..self.get_cell_count() as usize {
-            // println!("Shifing {i}, current: {}, new: {}", self.get_offset(i as u32) as usize + record_size);
-            // Shift over the offset.
-            self.write_record_offset(i, self.get_offset(i) + record_size);
-
+        // increase the fragmented size
+        self.set_fragmented(self.get_fragmented() + FreeBlock::size());
+        Ok(location)
+    }
+    /// Find a canddate for upating the chain
+    fn update_free_chain(&mut self, previous: Option<FreeBlock>, pointer: usize, start: usize, size: usize) -> Result<(), PageError> {
+        let current = FreeBlock::read(pointer, &*self)?;
+        let next_ptr = current.next as usize;
+        if current.offset == 0 {
+            // Use a non-active block.
+            FreeBlock::write(self, pointer, next_ptr, start, size);
+            Ok(())
+        } else if current.next == 0 {
+            println!("Descending allocating new blocck w/ {}", size);
+            // End of the chain, allocate a new block
+            let new_block = self.allocate_free_block(start, size)?;
+            println!("New pointer for {:?} is {new_block}", previous);
+            
+            // Update the previous block.
+            FreeBlock::write(self, previous.position, new_block, previous.offset as usize, previous.size as usize);
+        
+            
+            Ok(())
+        } else {
+            println!("Descending with size {}", size);
+            // Continue down the chain recursively.
+            self.update_free_chain(Some(current), next_ptr as usize, start, size)
+        }
+        // let block = FreeBlock::read(previous.next, self)?;
+    }
+    
+    /// Deletes a record from the database.
+    /// 
+    /// This will not perform any sort of rebalancing on the page.
+    /// It instead will just delete the record.
+    /// 
+    /// It will however shift over the offsets.
+    fn simple_delete(&mut self, record: usize) -> Result<(), PageError> {
+        if !self.check_record_exists(record) {
+            return Err(PageError::NoRecordFound)?;
         }
 
+        // The initial cell count before we perform the deletion.
+        let initial_cell_count = self.get_cell_count();
 
+        // Update the size.
+        let size = self.get_total_record_size(record).unwrap();
+        let offset = self.get_offset(record);
 
+        // Delete the actual offset.
+        let index_ptr = 2 * record + Projection::<Leaf>::header_size();
+        self[index_ptr..index_ptr + 2].fill(0);
+
+        // Delete the actual data.
+        self[offset..offset + size].fill(0);
+
+        // Update the used space.
+        self.set_used_space(self.get_used_space() - (size));
+
+        // Update the record count.
+        self.set_cell_count(initial_cell_count - 1);
+
+        // Shift the offsets over.
+        if initial_cell_count > 1 {
+            // If we had more than one we are going to need to shift these over.
+            let to_shift = self.calculate_offset_index(record);
+            let end_shft = self.calculate_offset_index(initial_cell_count - 1);
+
+            // Recall that the record offset is zeroed,
+            // so we just need to rotate the
+            // array left and we are good!
+            self[to_shift..end_shft + 2].rotate_left(2);
+        }
         
-
-        // Shift over the offsets.
-        // println!("View (1): {:?}", &self.view()[..40]);
+        // Update the free list. ONLY if the size is
+        println!("Making call to UFL {}", size);
+        self.update_free_list(offset, size)?;
         
-        let old = 2 * (record + 1) + 2;
-        let old_upper = 2 * (self.get_cell_count()) + 2;
-        let to_move = &self[old..old_upper].to_vec();
-        println!("TOP (0): {:?}", &self.view()[..40]);
-        println!("To move: {:?}", to_move);
-        self[old - 2..old_upper - 2].copy_from_slice(to_move);
-        self[old_upper - 2..old_upper].fill(0);
-        self.set_cell_count(self.get_cell_count() - 1);
-
-
-        
-        println!("TOP: {:?}", &self.view()[..40]);
-        // self[lower..]
-
-        // Shift over he acual rcord.
-
-        // println!("View (2): {:?}", &self.view()[..40]);
-        
-
-
 
         Ok(())
     }
 }
+
+
 
 
 #[cfg(test)]
@@ -267,7 +579,7 @@ mod tests {
     use overseer::{error::NetworkError, models::Value};
     use tempfile::tempdir;
 
-    use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::{leaf_page::Record, page::Transact}};
+    use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::{leaf_page::Record, page::{Projection, Transact}}};
 
     use super::Leaf;
 
@@ -275,11 +587,14 @@ mod tests {
 
     // TODO: Add unit tests to test mid-write failure.
 
+
+
+
     #[monoio::test]
-    pub async fn test_leaf_page_deletion() -> Result<(), Box<dyn Error + 'static>> {
+    pub async fn test_leaf_page_fill_fragmented() -> Result<(), Box<dyn Error + 'static>> {
         let dir = tempdir()?;
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
-        let page = paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+        paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
             
             leaf.write_record(Record { value: Some(Value::Integer(339939393)) }).await?;
             leaf.write_record(Record { value: Some(Value::Integer(332)) }).await?;
@@ -287,12 +602,47 @@ mod tests {
             
             // println!("hello: {:?}", leaf.view());
 
-            println!("Hello: {:?}", leaf.get_record_size(1));
+        
+            leaf.simple_delete(1)?;
+            leaf.simple_delete(0)?;
 
-            leaf.delete_record(0).await?;
+            println!("leaf: {:?}", &leaf[..40]);
+            println!("leaf: {:?}", &leaf[4020..]);
+            println!("wow: {:?}", leaf.read_free_chain().unwrap());
+
+            // leaf.write_record(Record { value: Some(Value::Integer(3)) }).await?;
+
+            // println!("wow: {:?}", leaf.read_free_chain().unwrap());
+            // println!("leaf: {:?}", &leaf[..40]);
+            // println!("leaf: {:?}", &leaf[4020..]);
+            
+
+            Ok(())
+        }).await?;
+
+        Ok(())
+    }
+
+
+    /// This just deletes a single record from the database.
+    #[monoio::test]
+    pub async fn test_leaf_page_deletion_basic() -> Result<(), Box<dyn Error + 'static>> {
+        let dir = tempdir()?;
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
+        paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+            
+            leaf.write_record(Record { value: Some(Value::Integer(339939393)) }).await?;
+            leaf.write_record(Record { value: Some(Value::Integer(332)) }).await?;
+            leaf.write_record(Record { value: Some(Value::Integer(83920320039092)) }).await?;
+            
+            // println!("hello: {:?}", leaf.view());
+
+        
+            leaf.simple_delete(1)?;
+
             
             assert_eq!(leaf.get_cell_count(), 2);
-            assert_eq!(leaf.read_record(0).await?.unwrap().value, Some(Value::Integer(332)));
+            assert_eq!(leaf.read_record(0).await?.unwrap().value, Some(Value::Integer(339939393)));
             assert_eq!(leaf.read_record(1).await?.unwrap().value, Some(Value::Integer(83920320039092)));
 
     
@@ -331,10 +681,16 @@ mod tests {
     pub async fn test_leaf_space_calculaion() {
         let dir = tempdir().unwrap();
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
-        paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
-            assert_eq!(leaf.get_remaining_space(), PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - 2);
-            leaf.write_record(Record { value: Some(Value::Integer(32)) }).await?;
-            assert_eq!(leaf.get_remaining_space(), PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - 4 - 3);
+        paged.new_page().await.unwrap().leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+
+            let base = PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - Projection::<Leaf>::header_size();
+            assert_eq!(leaf.get_free_space(), base);
+            let record = Record { value: Some(Value::Integer(32)) }.produce().await;
+            let record_space = record.total_serialized_size();
+            leaf.write_serialized_record(record).await?;
+            assert_eq!(leaf.get_free_space(), base - record_space - 2);
+            leaf.simple_delete(0)?;
+            assert_eq!(leaf.get_free_space(), base);
             Ok(())
         }).await.unwrap();
         

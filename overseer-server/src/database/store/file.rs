@@ -9,7 +9,7 @@ use super::paging::{meta::{PageType, RawPageAddress}, page::{Page, PageReference
 
 pub const MAGIC_BYTE: u8 = 0x83;
 pub const PAGE_SIZE: usize = 4096;
-pub const RESERVED_HEADER_SIZE: u32 = 512;
+pub const RESERVED_HEADER_SIZE: u32 = 4096;
 
 
 pub const PAGE_HEADER_RESERVED_BYTES: u32 = 1 + 4 + 4 + 1; // Is free + Previous
