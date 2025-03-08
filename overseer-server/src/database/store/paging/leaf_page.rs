@@ -12,7 +12,7 @@ use overseer::{error::NetworkError, models::{Key, Value}, network::{OverseerSerd
 
 use crate::database::store::file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE};
 
-use super::{error::PageError, page::{Page, Projection, Transact}};
+use super::{error::PageError, page::{Page, ProjReader, Projection, Transact}};
 
 
 /// How many slots a free block has.
@@ -233,6 +233,18 @@ impl Projection<Leaf> {
 
     }
 
+
+    pub async fn read_key(&self, index: usize) -> Result<Key, PageError> {
+        if !self.check_record_exists(index) {
+            return Err(PageError::NoRecordFound);
+        } else {
+            let offset = self.get_offset(index);
+            let mut reader = self.reader(offset as usize);
+            OvrInteger::read::<usize, _>(&mut reader).await?;
+            Ok(Key::deserialize(&mut reader).await.map_err(|_| PageError::RecordDeserializationFailure)?)
+        }
+    }
+
     /// Find suitable free block.
     fn find_free_slot(&self, size: usize) -> Option<Allocation> {
         println!("Finding a free block... for size {}", size);
@@ -375,6 +387,66 @@ impl Transact<Leaf> {
     pub async fn write_record(&mut self, record: Record) -> Result<(), PageError> {
         self.write_serialized_record(record.produce().await).await
     }
+
+    pub async fn find_record_offset_position(&mut self, record: &SerializedRecord) -> Result<usize, PageError> {
+        
+        let cells = self.get_cell_count() - 1; // we run this after we have incremented.
+        if cells == 0 {
+            return Ok(0);
+        } 
+
+        println!("INSERTING: {:?}", record.value.key);
+        //https://stackoverflow.com/questions/75692519/how-to-implement-binary-search-in-rust-with-usize-indexes
+        let mut right = cells;
+        
+        let mut left = 0;
+        println!("yu");
+        while left < right {
+            let midpoint = left + (right - left) / 2;
+            println!("There are {cells} cells which gives us a midpoint at {midpoint}");
+            let mid_key = self.read_key(midpoint).await?;
+
+            println!("The key at the midpoint is {midpoint} the comparison result is {:?}", record.value.key.cmp(&mid_key));
+
+            if record.value.key == mid_key {
+
+            } else if record.value.key > mid_key {
+                left = midpoint + 1;
+                
+            } else {
+                right = midpoint;
+            }
+        
+            
+        }
+
+        println!("FAILED {left}");
+        
+        
+
+        
+
+        Ok(left)
+    }
+
+    pub async fn insert_record_offset(&mut self, pointer: usize, record: &SerializedRecord) -> Result<usize, PageError> {
+        // Find a suitable position.
+        let position = self.find_record_offset_position(record).await?;
+
+        let cells = self.get_cell_count() - 1; // this is after we have incremented it.
+
+        let start = Projection::<Leaf>::calculate_offset_index(position);
+        let end = Projection::<Leaf>::calculate_offset_index(cells);
+
+        println!("View: {:?}", &self[..40]);
+        self[start..end + 2 + 2].rotate_right(2);
+        println!("View (1): {:?}", &self[..40]);
+        self[start..start + 2].copy_from_slice(&(pointer as u16).to_le_bytes());
+        println!("View (2): {:?}", &self[..40]);
+
+        Ok(position)
+    }
+
     pub async fn write_serialized_record(&mut self, record: SerializedRecord) -> Result<(), PageError> {
         if !self.will_fit(&record) {
             return Err(PageError::LeafPageFull);
@@ -403,7 +475,9 @@ impl Transact<Leaf> {
         // self.inner.write(file, record_ptr, record.data).await?;
 
         // Calculate the offset.
-        self.write_record_offset(new_cell_count as usize - 1, record_ptr);
+        self.insert_record_offset(record_ptr, &record).await?;
+        // self.insert_record_offset_position(&record).await?;
+        // self.write_record_offset(new_cell_count as usize - 1, record_ptr);
 
         // Commit this to the lead pointer.
         // The solver does not take the offset into account, so we need to update this.
@@ -666,6 +740,80 @@ mod tests {
         }.produce().await;
         let size = rec.total_serialized_size();
         (size, rec)
+    }
+
+    #[monoio::test]
+    pub async fn test_leaf_page_ordered_insert_2() -> Result<(), Box<dyn Error + 'static>> {
+        let dir = tempdir()?;
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
+        paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+            
+            let (_, rec_a) = make_test_record("a", Some(Value::Integer(339939393))).await;
+            let (_, rec_b) = make_test_record("b", Some(Value::Integer(332))).await;
+            let (_, rec_c) = make_test_record("c", Some(Value::Integer(83920320039092))).await;
+            let (_, rec_d) = make_test_record("d", Some(Value::Integer(83920320039092))).await;
+            let (_, rec_e) = make_test_record("e", Some(Value::Integer(83920320039092))).await;
+            
+            
+            
+            leaf.write_serialized_record(rec_d).await?;
+            leaf.write_serialized_record(rec_b).await?;
+            leaf.write_serialized_record(rec_a).await?;
+            leaf.write_serialized_record(rec_e).await?;
+            leaf.write_serialized_record(rec_c).await?;
+
+
+            assert_eq!(leaf.read_key(0).await?.as_str(), "a");
+            assert_eq!(leaf.read_key(1).await?.as_str(), "b");
+            assert_eq!(leaf.read_key(2).await?.as_str(), "c");
+            assert_eq!(leaf.read_key(3).await?.as_str(), "d");
+            assert_eq!(leaf.read_key(4).await?.as_str(), "e");
+        
+
+            Ok(())
+        }).await?;
+
+        Ok(())
+    }
+
+    /// This just deletes a single record from the database.
+    #[monoio::test]
+    pub async fn test_leaf_page_ordered_insert_1() -> Result<(), Box<dyn Error + 'static>> {
+        let dir = tempdir()?;
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
+        paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+            
+            let (_, rec_a) = make_test_record("a", Some(Value::Integer(339939393))).await;
+            let (_, rec_b) = make_test_record("b", Some(Value::Integer(332))).await;
+            let (_, rec_c) = make_test_record("c", Some(Value::Integer(83920320039092))).await;
+            let (_, rec_d) = make_test_record("d", Some(Value::Integer(83920320039092))).await;
+            let (_, rec_e) = make_test_record("e", Some(Value::Integer(83920320039092))).await;
+            
+            leaf.write_serialized_record(rec_a).await?;
+            leaf.write_serialized_record(rec_c).await?;
+            leaf.write_serialized_record(rec_d).await?;
+            leaf.write_serialized_record(rec_e).await?;
+            leaf.write_serialized_record(rec_b).await?;
+
+
+            assert_eq!(leaf.read_key(0).await?.as_str(), "a");
+            assert_eq!(leaf.read_key(1).await?.as_str(), "b");
+            assert_eq!(leaf.read_key(2).await?.as_str(), "c");
+            assert_eq!(leaf.read_key(3).await?.as_str(), "d");
+            assert_eq!(leaf.read_key(4).await?.as_str(), "e");
+        
+
+            Ok(())
+        }).await?;
+
+        Ok(())
+    }
+
+
+    #[test]
+    pub fn test_leaf_page_strcomp() {
+        assert!("a" < "b");
+        assert!("ba" < "bb");
     }
 
     /// This just deletes a single record from the database.
