@@ -7,7 +7,7 @@
 
 use std::{io::Cursor, process::exit};
 
-use overseer::{error::NetworkError, models::Value, network::{OverseerSerde, OvrInteger}};
+use overseer::{error::NetworkError, models::{Key, Value}, network::{OverseerSerde, OvrInteger}};
 
 
 use crate::database::store::file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE};
@@ -26,6 +26,7 @@ pub struct Leaf;
 // }
 
 pub struct Record {
+    key: Key,
     value: Option<Value>
 }
 
@@ -36,6 +37,12 @@ pub struct SerializedRecord {
 }
 
 impl Record {
+    pub fn new(key: Key, value: Option<Value>) -> Record {
+        Record {
+            key,
+            value
+        }
+    }
     pub async fn produce(self) -> SerializedRecord {
         let mut cursor = Cursor::new(vec![]);
         self.serialize(&mut cursor).await.unwrap();
@@ -59,12 +66,15 @@ impl SerializedRecord {
 impl OverseerSerde<Record> for Record {
     type E = NetworkError;
     async fn deserialize<R: overseer::models::LocalReadAsync>(reader: &mut R) -> Result<Record, Self::E> {
+        let key = Key::deserialize(reader).await?;
         let val = Option::<&Value>::deserialize(reader).await?;
         Ok(Self {
+            key: key,
             value: val
         })
     }
     async fn serialize<W: overseer::models::LocalWriteAsync>(&self, writer: &mut W) -> Result<(), Self::E> {
+        self.key.serialize(writer).await?;
         self.value.as_ref().serialize(writer).await?;
         Ok(())
     }
@@ -495,6 +505,7 @@ impl Transact<Leaf> {
         self.solve_allocate(allocate)?;
 
         // increase the fragmented size
+        println!("Before updating the fragmentation it was {}", self.get_fragmented());
         self.set_fragmented(self.get_fragmented() + FreeBlock::size());
         Ok(location)
     }
@@ -527,9 +538,16 @@ impl Transact<Leaf> {
         } else if current.next == 0 {
             println!("Descending allocating new blocck w/ {}", size);
             // End of the chain, allocate a new block
+
+            if size <= FRAGMENTATION_SIZE {
+                // Not worth it.
+                println!("NOT WORTH IT1");
+                self.set_fragmented(self.get_fragmented() + size);
+                return Ok(());
+            }
             
             let new_block = self.allocate_free_block(start, size)?;
-            println!("New pointer for {:?} is {new_block}", previous);
+            println!("New pointer for {:?} is {new_block} fragged, {}", previous, self.get_fragmented());
             
             // Update the previous block.
             FreeBlock::write(self, current.position, new_block, current.offset as usize, current.size as usize);
@@ -544,6 +562,25 @@ impl Transact<Leaf> {
         // let block = FreeBlock::read(previous.next, self)?;
     }
     
+   
+
+    pub async fn defragment(&mut self) -> Result<(), PageError> {
+        let copy = self.virtualize();
+
+        // We format ourself.
+        self.format();
+
+
+        for i in 0..copy.get_cell_count() {
+            // Write over all the record data.
+            let read_record = copy.read_record(i).await?.unwrap();
+            self.write_record(read_record).await?;
+        }
+        
+
+        Ok(())
+    }
+
     /// Deletes a record from the database.
     /// 
     /// This will not perform any sort of rebalancing on the page.
@@ -596,7 +633,7 @@ impl Transact<Leaf> {
         }
         
         // Update the free list. ONLY if the size is
-        println!("Making call to UFL {}", size);
+        println!("Making call to UFL {} {}", size, self.get_fragmented());
         self.update_free_list(offset, size)?;
         
 
@@ -611,17 +648,81 @@ impl Transact<Leaf> {
 mod tests {
     use std::error::Error;
 
-    use overseer::{error::NetworkError, models::Value};
+    use overseer::{error::NetworkError, models::{Key, Value}};
     use tempfile::tempdir;
 
     use crate::database::store::{file::{PagedFile, PAGE_HEADER_RESERVED_BYTES, PAGE_SIZE}, paging::{error::PageError, leaf_page::{FreeBlock, Record}, page::{Projection, Transact}}};
 
-    use super::Leaf;
+    use super::{Leaf, SerializedRecord};
 
   
 
     // TODO: Add unit tests to test mid-write failure.
 
+    async fn make_test_record<K: Into<Key>>(key: K, val: Option<Value>) -> (usize, SerializedRecord) {
+        let rec = Record {
+            key: key.into(),
+            value: val
+        }.produce().await;
+        let size = rec.total_serialized_size();
+        (size, rec)
+    }
+
+    /// This just deletes a single record from the database.
+    #[monoio::test]
+    pub async fn test_leaf_page_defrag() -> Result<(), Box<dyn Error + 'static>> {
+        let dir = tempdir()?;
+        let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
+        paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
+
+            
+            let (z_size, z_rec) = make_test_record("a", Some(Value::Integer(1))).await;
+            let (a_size, a_rec) = make_test_record("b", Some(Value::Integer(339939393))).await;
+            let (b_size, b_rec) = make_test_record("c", Some(Value::Integer(332))).await;
+            let (c_size, c_rec) = make_test_record("d", Some(Value::Integer(83920320039092))).await;
+            
+            leaf.write_serialized_record(z_rec).await?;
+            leaf.write_serialized_record(a_rec).await?;
+            leaf.write_serialized_record(b_rec).await?;
+            leaf.write_serialized_record(c_rec).await?;
+            
+            // println!("hello: {:?}", leaf.view());
+
+        
+            leaf.simple_delete(2)?;
+
+            assert_eq!(leaf.read_record(1).await?.unwrap().value, Some(Value::Integer(339939393)));
+            assert_eq!(leaf.read_record(2).await?.unwrap().value, Some(Value::Integer(83920320039092)));
+            assert_eq!(leaf.get_fragmented(), FreeBlock::size()); // make sure we have some fragmentation + a freeblock
+            
+            // This should be far too small to put in the free list.
+            leaf.simple_delete(0)?;
+            assert_eq!(leaf.get_fragmented(), FreeBlock::size() + z_size + 1); // make sure we have some fragmentation + a freeblock
+            
+
+            // We may now defrag.
+            leaf.defragment().await?;
+
+            assert_eq!(leaf.get_fragmented(), 0);
+            assert_eq!(leaf.read_record(0).await?.unwrap().value, Some(Value::Integer(339939393)));
+            assert_eq!(leaf.read_record(1).await?.unwrap().value, Some(Value::Integer(83920320039092)));
+            
+
+            
+            // assert_eq!(leaf.get_cell_count(), 2);
+            // assert_eq!(leaf.read_record(0).await?.unwrap().value, Some(Value::Integer(339939393)));
+            // assert_eq!(leaf.read_record(1).await?.unwrap().value, Some(Value::Integer(83920320039092)));
+
+    
+
+
+        
+
+            Ok(())
+        }).await?;
+
+        Ok(())
+    }
 
 
 
@@ -632,21 +733,17 @@ mod tests {
         paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
             
             // Get the records.
-            let record_a = Record { value: Some(Value::Integer(339939393)) }.produce().await;
-            let record_b = Record { value: Some(Value::Integer(332)) }.produce().await;
-            let record_c = Record { value: Some(Value::Integer(83920320039092)) }.produce().await;
-            let record_d = Record { value: Some(Value::Integer(83920320039092333)) }.produce().await;
+            let (total_a, rec_a) = make_test_record("a", Some(Value::Integer(339939393))).await;
+            let (total_b, rec_b) = make_test_record("b", Some(Value::Integer(332))).await;
+            let (total_c, rec_c) = make_test_record("c", Some(Value::Integer(83920320039092))).await;
+            let (total_d, rec_d) = make_test_record("d", Some(Value::Integer(83920320039092333))).await;
 
-            // Get the totals.
-            let total_a = record_a.total_serialized_size();
-            let total_b = record_b.total_serialized_size();
-            let total_c = record_c.total_serialized_size();
-            let total_d = record_d.total_serialized_size();
+
 
             // Write the records.
-            leaf.write_serialized_record(record_a).await?;
-            leaf.write_serialized_record(record_b).await?;
-            leaf.write_serialized_record(record_c).await?;
+            leaf.write_serialized_record(rec_a).await?;
+            leaf.write_serialized_record(rec_b).await?;
+            leaf.write_serialized_record(rec_c).await?;
             
      
 
@@ -674,7 +771,7 @@ mod tests {
             assert_eq!(fc.first().unwrap().size as usize, total_a + total_b + total_c);
 
             // This allocation should be performed into fragmented space.
-            leaf.write_serialized_record(record_d).await?;
+            leaf.write_serialized_record(rec_d).await?;
 
             // Verify the free chain is correct.
             let fc = leaf.read_free_chain()?;
@@ -706,10 +803,13 @@ mod tests {
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await?;
         paged.new_page().await?.leaf().open(&paged, async |leaf: &mut Transact<Leaf>| {
             
-            leaf.write_record(Record { value: Some(Value::Integer(339939393)) }).await?;
-            leaf.write_record(Record { value: Some(Value::Integer(332)) }).await?;
-            leaf.write_record(Record { value: Some(Value::Integer(83920320039092)) }).await?;
+            let (_, rec_a) = make_test_record("a", Some(Value::Integer(339939393))).await;
+            let (_, rec_b) = make_test_record("b", Some(Value::Integer(332))).await;
+            let (_, rec_c) = make_test_record("c", Some(Value::Integer(83920320039092))).await;
             
+            leaf.write_serialized_record(rec_a).await?;
+            leaf.write_serialized_record(rec_b).await?;
+            leaf.write_serialized_record(rec_c).await?;
             // println!("hello: {:?}", leaf.view());
 
         
@@ -760,7 +860,7 @@ mod tests {
 
             let base = PAGE_SIZE as usize - PAGE_HEADER_RESERVED_BYTES as usize - Projection::<Leaf>::header_size();
             assert_eq!(leaf.get_free_space(), base);
-            let record = Record { value: Some(Value::Integer(32)) }.produce().await;
+            let (_, record) = make_test_record("a", Some(Value::Integer(32))).await;
             let record_space = record.total_serialized_size();
             leaf.write_serialized_record(record).await?;
             assert_eq!(leaf.get_free_space(), base - record_space - 2);
@@ -783,7 +883,7 @@ mod tests {
 
         paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
             
-            let result: Result<(), PageError> = leaf.write_record(Record { value: Some(Value::String(massive_string)) }).await;
+            let result: Result<(), PageError> = leaf.write_record(Record { key: Key::from_str("a"), value: Some(Value::String(massive_string)) }).await;
             if let Err(result) = result {
                 
                 assert_eq!(result.variant(), PageError::LeafPageFull.variant());
@@ -808,9 +908,10 @@ mod tests {
         let mut paged = PagedFile::open(dir.path().join("hello.txt")).await.unwrap();
 
         paged.new_page().await.unwrap().leaf().open(&paged, async |leaf| {
-            leaf.write_record(Record { value: Some(Value::Integer(32)) }).await.unwrap();
-            leaf.write_record(Record { value: Some(Value::Integer(21)) }).await.unwrap();
-            leaf.write_record(Record { value: Some(Value::String("hello andrew".to_string())) }).await.unwrap();
+            leaf.write_record(Record::new(Key::from_str("a"), Some(Value::Integer(32)))).await.unwrap();
+            leaf.write_record(Record::new(Key::from_str("b"), Some(Value::Integer(21)))).await.unwrap();
+            leaf.write_record(Record::new(Key::from_str("c"), Some(Value::String("hello andrew".to_string())))).await.unwrap();
+ 
 
             assert_eq!(leaf.get_cell_count(), 3);
 

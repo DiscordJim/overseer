@@ -6,7 +6,7 @@ use crate::database::store::file::{PagedFile, MAGIC_BYTE, PAGE_HEADER_RESERVED_B
 
 use super::{error::PageError, leaf_page::Leaf, meta::{PageType, RawPageAddress}};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 /// This is a page that has not been loaded into
 /// memory, it essentially allows us the ability
 /// to load it in if we need it.
@@ -24,7 +24,8 @@ pub struct Page {
     pub backing: Box<[u8]>
 }
 
-#[derive(Debug)]
+
+#[derive(Debug, Clone)]
 pub struct PageMetadata {
     pub free: bool,
     pub previous: RawPageAddress,
@@ -109,9 +110,18 @@ async fn load_page(PageReference { pointer, size }: PageReference, page_file: &P
 //     Ok(())
 // }
 
+
+
 impl Page {
     pub fn start(&self) -> RawPageAddress {
         self.reference.pointer
+    }
+    pub fn produce_virtual(&self) -> Page {
+        Page {
+            backing: self.backing.clone(),
+            metadata: self.metadata.clone(),
+            reference: self.reference
+        }
     }
     pub fn project<P>(self) -> Projection<P> {
         Projection {
@@ -364,6 +374,25 @@ impl<P> Projection<P> {
     }
     pub fn view(&self) -> &[u8] {
         &self.page.backing
+    }
+    pub fn virtualize(&self) -> Virtual<P> {
+        Virtual {
+            projection: Projection {
+                page: self.page.produce_virtual(),
+                projection: PhantomData
+            }
+        }
+    }
+}
+
+pub struct Virtual<P> {
+    projection: Projection<P>
+}
+
+impl<P> Deref for Virtual<P> {
+    type Target = Projection<P>;
+    fn deref(&self) -> &Self::Target {
+        &self.projection
     }
 }
 
